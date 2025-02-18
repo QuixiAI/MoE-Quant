@@ -5,9 +5,14 @@ import argparse
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from safetensors import safe_open
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+
+
+from src import dist_utils
+from src import data_utils
 
 
 FP8_GROUP_SIZE = 128
@@ -24,10 +29,28 @@ def parse_args():
     )
     # Data params
     parser.add_argument(
-        "--sequence_length", 
-        default=8, 
+        "--dataset_name_or_path",
+        type=str,
+        required=True,
+        help="The name or path to calibration dataset",
+    )
+    parser.add_argument(
+        "--num_calibration_samples", 
+        default=128, 
+        type=int, 
+        help="Number of samples for calibration."
+    )
+    parser.add_argument(
+        "--max_sequence_length", 
+        default=8192, 
         type=int, 
         help="Calibration sequence length."
+    )
+    parser.add_argument(
+        "--seed", 
+        default=0, 
+        type=int, 
+        help="Random seed."
     )
     args = parser.parse_args()
     return args
@@ -81,11 +104,21 @@ def dequantize_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
 
 def main():
     args = parse_args()
-    device = "cuda"
+    # Distributed init
+    if dist.is_available():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    world_size = dist_utils.get_world_size()
+    rank = dist_utils.get_rank()
+    # init device
+    device = f"cuda:{rank}"
+    torch.set_grad_enabled(False)
+    torch.cuda.set_device(device)
 
+    # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
+    config.ep_size = world_size
 
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
@@ -98,24 +131,42 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
-    # Generate random input
-    inputs = torch.randint(0, model.vocab_size, size=(1, args.sequence_length), device=device)
+    # Prepare calibration dataset
+    calibration_dataset = data_utils.prepare_calibration_dataset(
+        args.dataset_name_or_path,
+        tokenizer,
+        args.max_sequence_length,
+        args.num_calibration_samples,
+        args.seed
+    )
+
+    # Take slices (if running on multiple workers)
+    if dist_utils.is_dist_available_and_initialized():
+        num_seq_per_rank = len(calibration_dataset) // world_size
+        calibration_dataset = calibration_dataset[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
+    dist_utils.barrier()
 
     # Load initial weight shard
     weight_dir = args.model_name_or_path
     current_shard_id = 1
     weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
 
-    param_buffer = load_param_shard(weight_dir, weight_path)
+    param_buffer = {}
+    if dist_utils.is_main():
+        param_buffer = load_param_shard(weight_dir, weight_path)
+    dist_utils.barrier()
         
-    # Load input embeddings on GPU
+    # Prepare input embedding
+    inputs = []
     model.model.embed_tokens.to_empty(device=device)
-    with torch.no_grad():
+    if dist_utils.is_main():
         model.model.embed_tokens.data = param_buffer["model.embed_tokens.weight"]
-        inputs = model.model.embed_tokens(inputs)
+    dist_utils.broadcast_parameters(model.model.embed_tokens)
+    for i in range(num_seq_per_rank):
+        inputs.append(model.model.embed_tokens(calibration_dataset[i].to(device)))
     # Offload embeddings back to meta
     model.model.embed_tokens.to(device="meta")
-    del param_buffer["model.embed_tokens.weight"]
+    param_buffer.pop("model.embed_tokens.weight", None)
 
     for block_idx, block in tqdm(
         enumerate(model.model.layers), 
@@ -123,26 +174,63 @@ def main():
         total=len(model.model.layers)
     ):
         prefix = f"model.layers.{block_idx}"
-        block_keys_with_prefix = set(f"{prefix}.{k}" for k in block.state_dict())
-        while not is_subset(block_keys_with_prefix, set(param_buffer.keys())):
-            current_shard_id += 1
-            weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
-            param_buffer.update(load_param_shard(weight_dir, weight_path))
-        # Select weights corresponding to chosen block and dequantize them
-        block_state_dict = {k[len(prefix)+1:]: v for k, v in param_buffer.items() if k.startswith(prefix)}
-        dequantize_state_dict(block_state_dict)
+
+        # Collect state dict keys from all processes
+        rank_block_keys = [k for k in block.state_dict()]
+        if dist_utils.is_main():
+            block_keys_with_prefix = [f"{prefix}.{k}" for k in rank_block_keys]
+            other_ranks_keys = []
+            for i in range(1, world_size):
+                other_rank_keys = [None for _ in rank_block_keys]
+                dist.recv_object_list(other_rank_keys, src=i)
+                block_keys_with_prefix.extend([f"{prefix}.{k}" for k in other_rank_keys])
+                other_ranks_keys.append(other_rank_keys)
+            # Make it a set
+            block_keys_with_prefix = set(block_keys_with_prefix)
+        else:
+            block_keys_with_prefix  = []
+            other_ranks_keys = []
+            dist.send_object_list(rank_block_keys, dst=0)
+
+        if dist_utils.is_main():
+            while not is_subset(block_keys_with_prefix, set(param_buffer.keys())):
+                current_shard_id += 1
+                weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
+                param_buffer.update(load_param_shard(weight_dir, weight_path))
+            # Select weights corresponding to chosen block and dequantize them
+            block_state_dict = {k[len(prefix)+1:]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+            dequantize_state_dict(block_state_dict)
+
         # Put block onto GPU
         block.to_empty(device=device)
-        block.load_state_dict(block_state_dict)
 
-        with torch.no_grad():
-            inputs = block(inputs)[0]
+        # Simply load block state dict on master and broadcast
+        if block_idx < model.config.first_k_dense_replace:        
+            if dist_utils.is_main():
+                block.load_state_dict(block_state_dict)
+            dist_utils.broadcast_parameters(block)
+        # Send dict with part of expets to target device
+        else:
+            if dist_utils.is_main():
+                for i in range(1, world_size):
+                    rank_state_dict = {k: block_state_dict[k] for k in other_ranks_keys[i - 1]}
+                    for k in rank_state_dict:
+                        dist.send(rank_state_dict[k].to(device), dst=i)
+            else:
+                rank_state_dict = block.state_dict()
+                for k in block.state_dict():
+                    dist.recv(rank_state_dict[k], src=0)
+
+        for i in range(num_seq_per_rank):
+            inputs[i] = block(inputs[i])[0]
 
         # Offload block
         block.to(device="meta")
         for k in block_keys_with_prefix:
-            del param_buffer[k]
+            param_buffer.pop(k, None)
         torch.cuda.empty_cache()
+    
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
