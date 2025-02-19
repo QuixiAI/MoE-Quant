@@ -47,11 +47,6 @@ def broadcast_parameters(module: nn.Module, src: Any = 0, group: Optional[Any] =
         dist.broadcast(param.data, src=src, group=group)
 
 
-def send_and_recv_dict(module: nn.Module, src: Any, dst: Any, group: Optional[Any] = None):
-    for param in module.parameters():
-        dist.broadcast(param.data, src=src, group=group)
-
-
 def gather_into_tensor(tensor, dim: int = 0):
     world_size = get_world_size()
     if is_main():

@@ -1,4 +1,5 @@
 import os
+import gc
 import math
 import argparse
 
@@ -141,9 +142,8 @@ def main():
     )
 
     # Take slices (if running on multiple workers)
-    if dist_utils.is_dist_available_and_initialized():
-        num_seq_per_rank = len(calibration_dataset) // world_size
-        calibration_dataset = calibration_dataset[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
+    num_seq_per_rank = len(calibration_dataset) // world_size
+    calibration_dataset = calibration_dataset[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
     dist_utils.barrier()
 
     # Load initial weight shard
@@ -161,7 +161,8 @@ def main():
     model.model.embed_tokens.to_empty(device=device)
     if dist_utils.is_main():
         model.model.embed_tokens.data = param_buffer["model.embed_tokens.weight"]
-    dist_utils.broadcast_parameters(model.model.embed_tokens)
+    if dist_utils.is_dist_available_and_initialized():
+        dist_utils.broadcast_parameters(model.model.embed_tokens)
     for i in range(num_seq_per_rank):
         inputs.append(model.model.embed_tokens(calibration_dataset[i].to(device)))
     # Offload embeddings back to meta
@@ -208,7 +209,8 @@ def main():
         if block_idx < model.config.first_k_dense_replace:        
             if dist_utils.is_main():
                 block.load_state_dict(block_state_dict)
-            dist_utils.broadcast_parameters(block)
+            if dist_utils.is_dist_available_and_initialized():
+                dist_utils.broadcast_parameters(block)
         # Send dict with part of expets to target device
         else:
             if dist_utils.is_main():
@@ -220,6 +222,10 @@ def main():
                 rank_state_dict = block.state_dict()
                 for k in block.state_dict():
                     dist.recv(rank_state_dict[k], src=0)
+            del rank_state_dict
+        # Clear memory before calibration
+        torch.cuda.empty_cache()
+        gc.collect()  
 
         for i in range(num_seq_per_rank):
             inputs[i] = block(inputs[i])[0]
@@ -228,7 +234,9 @@ def main():
         block.to(device="meta")
         for k in block_keys_with_prefix:
             param_buffer.pop(k, None)
+            
         torch.cuda.empty_cache()
+        gc.collect()
     
     dist.destroy_process_group()
 
