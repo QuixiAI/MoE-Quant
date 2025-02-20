@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -136,47 +138,22 @@ class Quantizer(nn.Module):
         return torch.all(self.scale != 0)
 
 
-class QLinear(nn.Module):
+def dequantize_linear_weight(
+    qweight: torch.Tensor, 
+    scale: torch.Tensor, 
+    zero: torch.Tensor, 
+    perm: Optional[torch.Tensor] = None, 
+):
+    scale = scale.view(qweight.shape[0], -1, 1)
+    zero = zero.view(qweight.shape[0], -1, 1)
+    num_groups = scale.shape[1]
+    weight = dequantize(qweight.view(qweight.shape[0], num_groups, -1), scale, zero).view_as(qweight)
+    if perm is not None:
+        invperm = perm.argsort()
+        weight =weight[:, invperm]
+    return weight   
 
-    def __init__(self, qweight, scale, zero, bias=None, perm=None, bits=8) -> None:
-        assert bits in [4, 8]
-        super().__init__()
-        self.bits = bits
-        self.in_features = qweight.shape[1]
-        self.out_features = qweight.shape[0]
-        self.perm = perm
-        if perm is not None:
-            self.invperm = perm.argsort()
-        else:
-            self.invperm = None
 
-        if bits == 4:
-            qweight = pack4to8(qweight)
-        self.register_buffer("qweight", qweight)
-        self.scale = nn.Parameter(scale)
-        self.register_buffer("zero", zero)
-
-        if bias is not None:
-            self.bias = nn.Parameter(bias)
-        else:
-            self.register_parameter("bias", None)
-
-    def get_weight(self):
-        qweight = self.qweight
-        if self.bits == 4:
-            qweight = pack8to4(qweight)
-
-        scale = self.scale.view(qweight.shape[0], -1, 1)
-        zero = self.zero.view(qweight.shape[0], -1, 1)
-
-        num_groups = scale.shape[1]
-        weight = dequantize(qweight.view(qweight.shape[0], num_groups, -1), scale, zero).view_as(qweight)
-        return weight
-
-    def forward(self, input: torch.Tensor):
-        if self.perm is not None:
-            input = input[..., self.perm]
-        # get weight without outliers
-        weight = self.get_weight()
-        out = F.linear(input, weight, self.bias)
-        return out
+def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor):
+    delta = q - w
+    return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)

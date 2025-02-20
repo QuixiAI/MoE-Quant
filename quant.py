@@ -11,11 +11,13 @@ import torch.distributed as dist
 from safetensors import safe_open
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+import wandb
 
 
 from src import dist_utils
 from src import data_utils
 from src import model_utils
+from src import quant_utils
 from src import gptq
 
 
@@ -85,8 +87,21 @@ def parse_args():
     parser.add_argument(
         "--save_dir", 
         type=str, 
-        required=True, 
+        default=None,
         help="where to save quantized model."
+    )
+    # Logging params
+    parser.add_argument(
+        "--log_wandb", 
+        default=False, 
+        action="store_true", 
+        help="Log to W&B"
+    )
+    parser.add_argument(
+        "--log_error", 
+        default=False, 
+        action="store_true", 
+        help="Whether to log relative L2 error"
     )
     # Misc params
     parser.add_argument(
@@ -162,6 +177,9 @@ def main():
     torch.set_grad_enabled(False)
     torch.cuda.set_device(device)
     offload_device = "cpu" if args.offload_activations else None
+     # Init W&B logger
+    if args.log_wandb and dist_utils.is_main():
+        wandb.init(config=args)
 
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -208,7 +226,7 @@ def main():
     inputs = []
     model.model.embed_tokens.to_empty(device=device)
     if dist_utils.is_main():
-        model.model.embed_tokens.data = param_buffer["model.embed_tokens.weight"]
+        model.model.embed_tokens.weight.data = param_buffer["model.embed_tokens.weight"].to(device=device)
     if dist_utils.is_dist_available_and_initialized():
         dist_utils.broadcast_parameters(model.model.embed_tokens)
     for i in range(num_seq_per_rank):
@@ -261,6 +279,7 @@ def main():
                 dist_utils.broadcast_parameters(block)
         # Send dict with part of expets to target device
         else:
+            rank_state_dict = {}
             if dist_utils.is_main():
                 for i in range(1, world_size):
                     rank_state_dict = {k: block_state_dict[k] for k in other_ranks_keys[i - 1]}
@@ -270,6 +289,7 @@ def main():
                 rank_state_dict = block.state_dict()
                 for k in block.state_dict():
                     dist.recv(rank_state_dict[k], src=0)
+                block.load_state_dict(rank_state_dict)
             del rank_state_dict
         # Clear memory before calibration
         torch.cuda.empty_cache()
@@ -314,6 +334,17 @@ def main():
         for handle_name, handle in shared_handles.items():
             dist_utils.print_on_main(f"Quantizing layer {handle_name}")
             qweight, scale, zero, perm = handle.quantize(args.bits)
+
+            if args.log_error:
+                weight = handle.layer.weight.float()
+                dequantized_weight = quant_utils.dequantize_linear_weight(
+                    qweight, scale, zero, perm
+                ).float()
+                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
+                dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
+                if args.log_wandb and dist_utils.is_main():
+                    wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
+
             if args.save_dir and dist_utils.is_main():
                 os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
                 torch.save(
@@ -328,12 +359,25 @@ def main():
             dist_utils.print_on_main(f"Processing experts")
         for handle_name, handle in expert_handles.items():
             qweight, scale, zero, perm = handle.quantize(args.bits)
+
+            if args.log_error:
+                weight = handle.layer.weight
+                dequantized_weight = quant_utils.dequantize_linear_weight(
+                    qweight, scale, zero, perm
+                )
+                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
+                dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
+                if args.log_wandb and dist_utils.is_main():
+                    wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
+
             if args.save_dir:
                 os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
                 torch.save(
                     {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
                     os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
                 )
+            # Destroy handle
+            handle.reset()
 
         dist_utils.barrier()
 
@@ -346,6 +390,10 @@ def main():
         for k in block_keys_with_prefix:
             param_buffer.pop(k, None)
             
+        del handles
+        del shared_handles
+        del expert_handles
+        del hooks
         torch.cuda.empty_cache()
         gc.collect()
     

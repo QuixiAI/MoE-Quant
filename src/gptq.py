@@ -1,4 +1,3 @@
-import itertools
 from typing import Tuple, Optional, List
 
 import torch
@@ -67,7 +66,7 @@ class GPTQ:
         batch_size = input.shape[0]
         # init hessian
         if self.H is None:
-            self.H = torch.zeros((self.d_col, self.d_col), device=input.device, dtype=input.dtype)
+            self.H = torch.zeros((self.d_col, self.d_col), device=input.device, dtype=torch.float32)
         # input reshaping
         if isinstance(self.layer, nn.Linear):
             input = input.reshape(-1, input.shape[-1])
@@ -81,6 +80,7 @@ class GPTQ:
             # output size (batch_size, channels * \prod kernel_size, num_patches)
             input = unfold(input)
             input = input.transpose(1, 2).flatten(0, 1)
+        input = input.float()
         # hessian update
         beta = self.num_samples / (self.num_samples + batch_size)
         alpha = 2.0 / (self.num_samples + batch_size)
@@ -113,7 +113,7 @@ class GPTQ:
         self.H[range(self.d_col), range(self.d_col)] += damp
         # 2) Weight preparation
         # copy weight, flatten
-        self.W = self.W.clone()
+        self.W = self.W.clone().float()
         if isinstance(self.layer, _ConvNd):
             self.W = self.W.flatten(1, -1)
         self.W[:, pruned_ids] = 0
@@ -208,7 +208,7 @@ class GPTQ:
         w = self.W
         # get columns with all zeros
         zero_cols = torch.nonzero(w.eq(0).all(dim=0))
-        H = self.H.float()
+        H = self.H
         # mask rows with zero input channels
         H[zero_cols, :] = 0
         H[:, zero_cols] = 0
@@ -216,8 +216,8 @@ class GPTQ:
         # invert
         try:
             H = linalg_utils.inv_sym(H)
-            H_inv_cho = torch.linalg.cholesky(H, upper=True).to(self.W_dtype)
+            H_inv_cho = torch.linalg.cholesky(H, upper=True)
         except:
-            H_inv_cho = torch.eye(self.d_col, device=H.device, dtype=self.W_dtype)
+            H_inv_cho = torch.eye(self.d_col, device=H.device, dtype=torch.float32)
         return w, H_inv_cho
     
