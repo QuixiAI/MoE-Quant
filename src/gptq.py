@@ -101,10 +101,13 @@ class GPTQ:
         """
         # 1) Hessian preparation
         if self.H is None:
-            self.H = torch.eye(self.d_col, device=self.W_device, dtype=self.W_dtype)
+            self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
         # synchronize Hessians
         if self.is_distributed and dist_utils.is_dist_available_and_initialized():
             dist.all_reduce(self.H, op=dist.ReduceOp.AVG)
+        # Dirty NaN-hack
+        if torch.isnan(self.H).any().item():
+            self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
         # get ids of pruned channels
         pruned_ids = torch.diag(self.H) == 0
         self.H[pruned_ids, pruned_ids] = 1

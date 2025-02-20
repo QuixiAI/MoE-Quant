@@ -279,8 +279,11 @@ def main():
                 dist_utils.broadcast_parameters(block)
         # Send dict with part of expets to target device
         else:
-            rank_state_dict = {}
             if dist_utils.is_main():
+                # Load state dict on master
+                rank_state_dict = {k: block_state_dict[k] for k in rank_block_keys}
+                block.load_state_dict(rank_state_dict)
+                # Send to other processes
                 for i in range(1, world_size):
                     rank_state_dict = {k: block_state_dict[k] for k in other_ranks_keys[i - 1]}
                     for k in rank_state_dict:
@@ -358,13 +361,14 @@ def main():
         if len(expert_handles) > 0:
             dist_utils.print_on_main(f"Processing experts")
         for handle_name, handle in expert_handles.items():
+            dist_utils.print_on_main(f"Quantizing layer {handle_name}")
             qweight, scale, zero, perm = handle.quantize(args.bits)
 
             if args.log_error:
-                weight = handle.layer.weight
+                weight = handle.layer.weight.float()
                 dequantized_weight = quant_utils.dequantize_linear_weight(
                     qweight, scale, zero, perm
-                )
+                ).float()
                 relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
                 dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                 if args.log_wandb and dist_utils.is_main():
