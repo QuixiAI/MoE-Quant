@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 import math
 import argparse
 
@@ -14,9 +15,12 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 from src import dist_utils
 from src import data_utils
+from src import model_utils
+from src import gptq
 
 
 FP8_GROUP_SIZE = 128
+ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
 
 
 def parse_args():
@@ -46,6 +50,49 @@ def parse_args():
         default=8192, 
         type=int, 
         help="Calibration sequence length."
+    )
+    # Quantization params
+    parser.add_argument(
+        "--bits",
+        type=int,
+        required=True,
+        help="Quantization bitwidth.",
+    )
+    parser.add_argument(
+        "--group_size",
+        type=int,
+        default=None,
+        help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
+    )
+    parser.add_argument(
+        "--act_order",
+        action="store_true",
+        help="Whether to permute in activation order.",
+    )
+    parser.add_argument(
+        "--sym", 
+        action="store_true", 
+        help="Whether to use symmetric quantization"
+    )
+    parser.add_argument(
+        "--perchannel",
+        action="store_true",
+        help="Fit a unique quantizer to each output dim",
+    )
+    parser.add_argument("--rel_damp", type=float, default=1e-2)
+    parser.add_argument("--block_size", type=int, default=128)
+    # Save params
+    parser.add_argument(
+        "--save_dir", 
+        type=str, 
+        required=True, 
+        help="where to save quantized model."
+    )
+    # Misc params
+    parser.add_argument(
+        "--offload_activations", 
+        action="store_true", 
+        help="whether to offload activations to CPU."
     )
     parser.add_argument(
         "--seed", 
@@ -114,6 +161,7 @@ def main():
     device = f"cuda:{rank}"
     torch.set_grad_enabled(False)
     torch.cuda.set_device(device)
+    offload_device = "cpu" if args.offload_activations else None
 
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -164,7 +212,7 @@ def main():
     if dist_utils.is_dist_available_and_initialized():
         dist_utils.broadcast_parameters(model.model.embed_tokens)
     for i in range(num_seq_per_rank):
-        inputs.append(model.model.embed_tokens(calibration_dataset[i].to(device)))
+        inputs.append(model.model.embed_tokens(calibration_dataset[i].to(device)).to(offload_device))
     # Offload embeddings back to meta
     model.model.embed_tokens.to(device="meta")
     param_buffer.pop("model.embed_tokens.weight", None)
@@ -174,17 +222,17 @@ def main():
         desc="Processing transformer blocks",
         total=len(model.model.layers)
     ):
-        prefix = f"model.layers.{block_idx}"
+        prefix = f"model.layers.{block_idx}."
 
         # Collect state dict keys from all processes
         rank_block_keys = [k for k in block.state_dict()]
         if dist_utils.is_main():
-            block_keys_with_prefix = [f"{prefix}.{k}" for k in rank_block_keys]
+            block_keys_with_prefix = [f"{prefix}{k}" for k in rank_block_keys]
             other_ranks_keys = []
             for i in range(1, world_size):
                 other_rank_keys = [None for _ in rank_block_keys]
                 dist.recv_object_list(other_rank_keys, src=i)
-                block_keys_with_prefix.extend([f"{prefix}.{k}" for k in other_rank_keys])
+                block_keys_with_prefix.extend([f"{prefix}{k}" for k in other_rank_keys])
                 other_ranks_keys.append(other_rank_keys)
             # Make it a set
             block_keys_with_prefix = set(block_keys_with_prefix)
@@ -199,7 +247,7 @@ def main():
                 weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
                 param_buffer.update(load_param_shard(weight_dir, weight_path))
             # Select weights corresponding to chosen block and dequantize them
-            block_state_dict = {k[len(prefix)+1:]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+            block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
             dequantize_state_dict(block_state_dict)
 
         # Put block onto GPU
@@ -227,8 +275,71 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()  
 
+        # Hessian estimate
+        layers = model_utils.select_layers(model, prefix, ".*", model_utils.LINEAR_LAYERS)
+        handles = {}
+        hooks = {}
+
+        for layer_name, layer in layers.items():
+            def update_handle_hook(name):
+                def _hook(_, inp, out):
+                    handles[name].update(inp[0])
+                return _hook
+
+            handles[layer_name] = gptq.GPTQ(
+                layer,
+                args.perchannel,
+                args.group_size,
+                args.sym,
+                args.rel_damp,
+                args.block_size,
+                args.act_order,
+                is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is not None
+            )
+            hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
+
+        # Collect Hessians
         for i in range(num_seq_per_rank):
-            inputs[i] = block(inputs[i])[0]
+            block(inputs[i].to(device))
+
+        for _, h in hooks.items():
+            h.remove()
+
+        dist_utils.barrier()
+ 
+        shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
+        expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
+
+        # Quantized shared handles first
+        for handle_name, handle in shared_handles.items():
+            dist_utils.print_on_main(f"Quantizing layer {handle_name}")
+            qweight, scale, zero, perm = handle.quantize(args.bits)
+            if args.save_dir and dist_utils.is_main():
+                os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
+                torch.save(
+                    {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
+                    os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                )
+            # Destroy handle
+            handle.reset()
+
+        # Quantize experts
+        if len(expert_handles) > 0:
+            dist_utils.print_on_main(f"Processing experts")
+        for handle_name, handle in expert_handles.items():
+            qweight, scale, zero, perm = handle.quantize(args.bits)
+            if args.save_dir:
+                os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
+                torch.save(
+                    {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
+                    os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                )
+
+        dist_utils.barrier()
+
+        # Update activations
+        for i in range(num_seq_per_rank):
+            inputs[i] = block(inputs[i].to(device))[0].to(offload_device)
 
         # Offload block
         block.to(device="meta")
