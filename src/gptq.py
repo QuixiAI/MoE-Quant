@@ -48,6 +48,10 @@ class GPTQ:
         self.H = None
         self.num_samples = 0
         self.is_distributed = is_distributed
+        # Flags indicating issues
+        self.issue_zero_samples = False
+        self.issue_nan_hessian = False
+        self.issue_non_invertible = False
 
     @staticmethod
     def _validate_layer(layer):
@@ -102,12 +106,14 @@ class GPTQ:
         # 1) Hessian preparation
         if self.H is None:
             self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
+            self.issue_zero_samples = True
         # synchronize Hessians
         if self.is_distributed and dist_utils.is_dist_available_and_initialized():
             dist.all_reduce(self.H, op=dist.ReduceOp.AVG)
-        # Dirty NaN-hack
+        # Replace matrix by identity in case of NaNs
         if torch.isnan(self.H).any().item():
             self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
+            self.issue_nan_hessian = True
         # get ids of pruned channels
         pruned_ids = torch.diag(self.H) == 0
         self.H[pruned_ids, pruned_ids] = 1
@@ -222,5 +228,6 @@ class GPTQ:
             H_inv_cho = torch.linalg.cholesky(H, upper=True)
         except:
             H_inv_cho = torch.eye(self.d_col, device=H.device, dtype=torch.float32)
+            self.issue_non_invertible = True
         return w, H_inv_cho
     

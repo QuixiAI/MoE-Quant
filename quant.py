@@ -334,9 +334,16 @@ def main():
         expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
 
         # Quantized shared handles first
+        num_issue_zero_samples = 0
+        num_issue_nan_hessian = 0
+        num_issue_non_invertible = 0
         for handle_name, handle in shared_handles.items():
             dist_utils.print_on_main(f"Quantizing layer {handle_name}")
             qweight, scale, zero, perm = handle.quantize(args.bits)
+            # Update issue tracker
+            num_issue_zero_samples += handle.issue_zero_samples
+            num_issue_nan_hessian += handle.issue_nan_hessian
+            num_issue_non_invertible += handle.issue_non_invertible
 
             if args.log_error:
                 weight = handle.layer.weight.float()
@@ -357,33 +364,55 @@ def main():
             # Destroy handle
             handle.reset()
 
+        dist_utils.print_on_main("-" * 10)
+        dist_utils.print_on_main(f"GPTQ calibration issues for shared modules:")
+        dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
+        dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
+        dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+        dist_utils.print_on_main("-" * 10)
+
         # Quantize experts
+        num_issue_zero_samples = 0
+        num_issue_nan_hessian = 0
+        num_issue_non_invertible = 0
         if len(expert_handles) > 0:
             dist_utils.print_on_main(f"Processing experts")
-        for handle_name, handle in expert_handles.items():
-            dist_utils.print_on_main(f"Quantizing layer {handle_name}")
-            qweight, scale, zero, perm = handle.quantize(args.bits)
 
-            if args.log_error:
-                weight = handle.layer.weight.float()
-                dequantized_weight = quant_utils.dequantize_linear_weight(
-                    qweight, scale, zero, perm
-                ).float()
-                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
-                dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
-                if args.log_wandb and dist_utils.is_main():
-                    wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
+            for handle_name, handle in expert_handles.items():
+                dist_utils.print_on_main(f"Quantizing layer {handle_name}")
+                qweight, scale, zero, perm = handle.quantize(args.bits)
+                # Update issue tracker
+                num_issue_zero_samples += handle.issue_zero_samples
+                num_issue_nan_hessian += handle.issue_nan_hessian
+                num_issue_non_invertible += handle.issue_non_invertible
 
-            if args.save_dir:
-                os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
-                torch.save(
-                    {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
-                    os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
-                )
-            # Destroy handle
-            handle.reset()
+                if args.log_error:
+                    weight = handle.layer.weight.float()
+                    dequantized_weight = quant_utils.dequantize_linear_weight(
+                        qweight, scale, zero, perm
+                    ).float()
+                    relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
+                    dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
+                    if args.log_wandb and dist_utils.is_main():
+                        wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
 
-        dist_utils.barrier()
+                if args.save_dir:
+                    os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
+                    torch.save(
+                        {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
+                        os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                    )
+                # Destroy handle
+                handle.reset()
+
+            dist_utils.barrier()
+
+            dist_utils.print_on_main("-" * 10)
+            dist_utils.print_on_main(f"GPTQ calibration issues for expert modules:")
+            dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
+            dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
+            dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+            dist_utils.print_on_main("-" * 10)
 
         # Update activations
         for i in range(num_seq_per_rank):

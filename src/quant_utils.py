@@ -156,7 +156,4 @@ def dequantize_linear_weight(
 
 def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor):
     delta = q - w
-    try:
-        return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
-    except:
-        return 
+    return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
