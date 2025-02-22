@@ -236,6 +236,7 @@ def main():
         os.path.join(args.packed_model_path, current_output_shard_path)
     )
     safetensors_index["lm_head.weight"] = current_output_shard_path
+    safetensors_index["model.norm.weight"] = current_output_shard_path
     # Save safetensors index
     with open(os.path.join(args.packed_model_path, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {}, "weight_map": safetensors_index}, f)
