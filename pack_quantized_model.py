@@ -1,6 +1,7 @@
 import os
 import gc
 import json
+import shutil
 import argparse
 from collections import defaultdict
 from typing import Optional, Any
@@ -182,8 +183,6 @@ def main():
         desc="Processing transformer blocks",
         total=len(model.model.layers)
     ):
-        if block_idx == 4:
-            assert False
         current_output_shard_id += 1
         prefix = f"model.layers.{block_idx}."
         block_keys_with_prefix = set(f"{prefix}{k}" for k in block.state_dict())
@@ -209,7 +208,7 @@ def main():
         current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
         save_file(
             block_state_dict, 
-            os.path.join(args.packed_model_path, current_output_shard_id)
+            os.path.join(args.packed_model_path, current_output_shard_path)
         )
         for k in block_state_dict:
             safetensors_index[k] = current_output_shard_path
@@ -247,6 +246,11 @@ def main():
     model.generation_config.save_pretrained(args.packed_model_path)
     # Save tokenizer
     tokenizer.save_pretrained(args.packed_model_path)
+    # Copy modeling script
+    shutil.copy(
+        os.path.join(args.model_name_or_path, "modeling_deepseek.py"), 
+        args.packed_model_path
+    )
 
 
 if __name__ == "__main__":
