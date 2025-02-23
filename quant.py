@@ -81,8 +81,22 @@ def parse_args():
         action="store_true",
         help="Fit a unique quantizer to each output dim",
     )
-    parser.add_argument("--rel_damp", type=float, default=1e-2)
-    parser.add_argument("--block_size", type=int, default=128)
+    parser.add_argument(
+        "--rel_damp", 
+        type=float, 
+        default=1e-2
+    )
+    parser.add_argument(
+        "--block_size", 
+        type=int, 
+        default=128
+    )
+    parser.add_argument(
+        "--quantize_only_experts", 
+        default=False, 
+        action="store_true", 
+        help="Whether to quantize only routed (non-shared) experts."
+    )
     # Save params
     parser.add_argument(
         "--save_dir", 
@@ -114,6 +128,13 @@ def parse_args():
         default=0, 
         type=int, 
         help="Random seed."
+    )    
+    parser.add_argument(
+        "--dtype", 
+        default="float16", 
+        type=str,
+        choices=["float16", "bfloat16"], 
+        help="Torch dtype used."
     )
     args = parser.parse_args()
     return args
@@ -151,15 +172,15 @@ def load_param_shard(weight_dir: str, weight_path: str) -> dict[str, torch.Tenso
     return param_shard
 
 
-def dequantize_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
+def dequantize_state_dict(state_dict: dict[str, torch.Tensor], dtype: torch.dtype = torch.float16) -> None:
     state_dict_keys = list(state_dict.keys())
     # Dequantize
     for k in state_dict_keys:
         if k.endswith("scale_inv"):
             layer_name, _ = k.rsplit(".", 1)
 
-            W = state_dict[f"{layer_name}.weight"].to(torch.bfloat16) 
-            s = state_dict[f"{layer_name}.weight_scale_inv"].to(torch.bfloat16) 
+            W = state_dict[f"{layer_name}.weight"].to(dtype) 
+            s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype) 
 
             state_dict[f"{layer_name}.weight"] = dequantize_weight_from_fp8(W, s)
             del state_dict[f"{layer_name}.weight_scale_inv"]
@@ -177,6 +198,7 @@ def main():
     torch.set_grad_enabled(False)
     torch.cuda.set_device(device)
     offload_device = "cpu" if args.offload_activations else None
+    dtype = getattr(torch, args.dtype)
      # Init W&B logger
     if args.log_wandb and dist_utils.is_main():
         wandb.init(config=args)
@@ -192,7 +214,7 @@ def main():
             config=config,
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16
+            torch_dtype=dtype
         ).eval()
         model.config.use_cache = False
 
@@ -226,7 +248,7 @@ def main():
     inputs = []
     model.model.embed_tokens.to_empty(device=device)
     if dist_utils.is_main():
-        model.model.embed_tokens.weight.data = param_buffer["model.embed_tokens.weight"].to(device=device)
+        model.model.embed_tokens.weight.data = param_buffer["model.embed_tokens.weight"].to(device=device, dtype=dtype)
     if dist_utils.is_dist_available_and_initialized():
         dist_utils.broadcast_parameters(model.model.embed_tokens)
     for i in range(num_seq_per_rank):
@@ -266,7 +288,7 @@ def main():
                 param_buffer.update(load_param_shard(weight_dir, weight_path))
             # Select weights corresponding to chosen block and dequantize them
             block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
-            dequantize_state_dict(block_state_dict)
+            dequantize_state_dict(block_state_dict, dtype)
 
         # Put block onto GPU
         block.to_empty(device=device)
@@ -309,6 +331,9 @@ def main():
                     handles[name].update(inp[0])
                 return _hook
 
+            if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
+                continue
+
             handles[layer_name] = gptq.GPTQ(
                 layer,
                 args.perchannel,
@@ -317,7 +342,7 @@ def main():
                 args.rel_damp,
                 args.block_size,
                 args.act_order,
-                is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is not None
+                is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None
             )
             hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
@@ -340,6 +365,10 @@ def main():
         for handle_name, handle in shared_handles.items():
             dist_utils.print_on_main(f"Quantizing layer {handle_name}")
             qweight, scale, zero, perm = handle.quantize(args.bits)
+            # Construct dequantized weight
+            dequantized_weight = quant_utils.dequantize_linear_weight(
+                qweight, scale, zero, perm
+            )
             # Update issue tracker
             num_issue_zero_samples += handle.issue_zero_samples
             num_issue_nan_hessian += handle.issue_nan_hessian
@@ -347,10 +376,7 @@ def main():
 
             if args.log_error:
                 weight = handle.layer.weight.float()
-                dequantized_weight = quant_utils.dequantize_linear_weight(
-                    qweight, scale, zero, perm
-                ).float()
-                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
+                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight.float(), weight, handle.H)
                 dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                 if args.log_wandb and dist_utils.is_main():
                     wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
@@ -361,6 +387,8 @@ def main():
                     {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
                     os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
                 )
+            # Replace original weight by quantized one
+            handle.layer.weight.data = dequantized_weight
             # Destroy handle
             handle.reset()
 
@@ -381,6 +409,10 @@ def main():
             for handle_name, handle in expert_handles.items():
                 dist_utils.print_on_main(f"Quantizing layer {handle_name}")
                 qweight, scale, zero, perm = handle.quantize(args.bits)
+                # Construct dequantized weight
+                dequantized_weight = quant_utils.dequantize_linear_weight(
+                    qweight, scale, zero, perm
+                )
                 # Update issue tracker
                 num_issue_zero_samples += handle.issue_zero_samples
                 num_issue_nan_hessian += handle.issue_nan_hessian
@@ -388,10 +420,7 @@ def main():
 
                 if args.log_error:
                     weight = handle.layer.weight.float()
-                    dequantized_weight = quant_utils.dequantize_linear_weight(
-                        qweight, scale, zero, perm
-                    ).float()
-                    relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight, handle.H)
+                    relative_mse = quant_utils.get_relative_mse_error(dequantized_weight.float(), weight, handle.H)
                     dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                     if args.log_wandb and dist_utils.is_main():
                         wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
@@ -402,6 +431,8 @@ def main():
                         {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
                         os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
                     )
+                # Replace original weight by quantized one
+                handle.layer.weight.data = dequantized_weight
                 # Destroy handle
                 handle.reset()
 
