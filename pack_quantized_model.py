@@ -8,11 +8,13 @@ from typing import Optional, Any
 
 from tqdm import tqdm
 import torch
-from safetensors import safe_open
 from safetensors.torch import save_file
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from compressed_tensors.compressors import pack_to_int32
+
+from src import quant_utils
+from src import loading_utils
 
 
 def parse_args():
@@ -64,21 +66,20 @@ def parse_args():
         action="store_true",
         help="Fit a unique quantizer to each output dim",
     )
+     # Misc params
+    parser.add_argument(
+        "--dtype", 
+        default="float16", 
+        type=str,
+        choices=["float16", "bfloat16"], 
+        help="Torch dtype used."
+    )
     args = parser.parse_args()
     return args
 
 
 def is_subset(set1: set, set2: set):
     return set1 <= set2
-
-
-def load_param_shard(weight_dir: str, weight_path: str) -> dict[str, torch.Tensor]:
-    param_shard = {}
-    with safe_open(os.path.join(weight_dir, weight_path), framework="pt", device="cpu") as f:
-        param_shard_keys = f.keys()
-        for k in param_shard_keys:
-            param_shard[k] = f.get_tensor(k)
-    return param_shard
 
 
 def pack_weight(
@@ -103,6 +104,9 @@ def pack_weight(
 
 
 def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
+    ignored_modules = ["lm_head"]
+    if args.quantize_only_experts:
+        ignored_modules += ["re:.*self_attn.*", "re:.*shared_experts.*"]
     return {
         "config_groups": {
             "group_0": {
@@ -126,7 +130,7 @@ def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
             }
         },
         "format": "pack-quantized",
-        "ignore": ["lm_head"],
+        "ignore": ignored_modules,
         "kv_cache_scheme": None,
         "quant_method": "compressed-tensors",
         "quantization_status": "compressed"
@@ -135,6 +139,8 @@ def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
 
 def main():
     args = parse_args()
+
+    dtype = getattr(torch, args.dtype)
 
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -166,7 +172,7 @@ def main():
     current_input_shard_id = 1
     weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
 
-    param_buffer = load_param_shard(weight_dir, weight_path)
+    param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
 
     # Save embeddings
     current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
@@ -190,9 +196,10 @@ def main():
         while not is_subset(block_keys_with_prefix, set(param_buffer.keys())):
             current_input_shard_id += 1
             weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
-            param_buffer.update(load_param_shard(weight_dir, weight_path))
+            param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
 
-        block_state_dict = {f"{prefix}{k}": param_buffer[f"{prefix}{k}"] for k in block.state_dict().keys()}
+        block_state_dict = {k: param_buffer[k] for k in param_buffer if k.startswith(prefix)}
+        quant_utils.dequantize_state_dict(block_state_dict, dtype)
 
         for layer_name in quantized_layer_names[block_idx]:
             weight_state_dict = torch.load(
@@ -223,7 +230,7 @@ def main():
     if current_input_shard_id < 163:
         current_input_shard_id = 163
         weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
-        param_buffer.update(load_param_shard(weight_dir, weight_path))
+        param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
 
     # Save lm head
     current_output_shard_id += 1

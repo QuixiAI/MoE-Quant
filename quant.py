@@ -1,14 +1,11 @@
 import os
 import gc
 import re
-import math
 import argparse
 
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-from safetensors import safe_open
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 import wandb
@@ -18,10 +15,10 @@ from src import dist_utils
 from src import data_utils
 from src import model_utils
 from src import quant_utils
+from src import loading_utils
 from src import gptq
 
 
-FP8_GROUP_SIZE = 128
 ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
 
 
@@ -144,48 +141,6 @@ def is_subset(set1: set, set2: set):
     return set1 <= set2
 
 
-def dequantize_weight_from_fp8(W, s):
-    g = FP8_GROUP_SIZE
-    # Dequantize weight
-    d_out, d_in = W.shape
-    # Pad weight if needed
-    pad_out = math.ceil(d_out / g) * g - d_out
-    pad_in = math.ceil(d_in / g) * g - d_in
-    W = F.pad(W, (0, pad_in, 0, pad_out))
-    d_out_pad, d_in_pad = W.shape
-
-    W = W.view(d_out_pad // g, g, d_in_pad // g, g) 
-    s = s.view(d_out_pad // g, 1, d_in_pad // g, 1)
-    W = (W * s).view(d_out_pad, d_in_pad)
-
-    # Remove padding
-    W = W[:d_out, :d_in]
-    return W
-
-
-def load_param_shard(weight_dir: str, weight_path: str) -> dict[str, torch.Tensor]:
-    param_shard = {}
-    with safe_open(os.path.join(weight_dir, weight_path), framework="pt", device="cpu") as f:
-        param_shard_keys = f.keys()
-        for k in param_shard_keys:
-            param_shard[k] = f.get_tensor(k)
-    return param_shard
-
-
-def dequantize_state_dict(state_dict: dict[str, torch.Tensor], dtype: torch.dtype = torch.float16) -> None:
-    state_dict_keys = list(state_dict.keys())
-    # Dequantize
-    for k in state_dict_keys:
-        if k.endswith("scale_inv"):
-            layer_name, _ = k.rsplit(".", 1)
-
-            W = state_dict[f"{layer_name}.weight"].to(dtype) 
-            s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype) 
-
-            state_dict[f"{layer_name}.weight"] = dequantize_weight_from_fp8(W, s)
-            del state_dict[f"{layer_name}.weight_scale_inv"]
-
-
 def main():
     args = parse_args()
     # Distributed init
@@ -241,7 +196,7 @@ def main():
 
     param_buffer = {}
     if dist_utils.is_main():
-        param_buffer = load_param_shard(weight_dir, weight_path)
+        param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
     dist_utils.barrier()
         
     # Prepare input embedding
@@ -282,13 +237,18 @@ def main():
             dist.send_object_list(rank_block_keys, dst=0)
 
         if dist_utils.is_main():
-            while not is_subset(block_keys_with_prefix, set(param_buffer.keys())):
+            can_dequantize = True
+            # Select weights corresponding to current block
+            block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+            while not (is_subset(block_keys_with_prefix, set(param_buffer.keys())) and can_dequantize):
                 current_shard_id += 1
                 weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
-                param_buffer.update(load_param_shard(weight_dir, weight_path))
-            # Select weights corresponding to chosen block and dequantize them
-            block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
-            dequantize_state_dict(block_state_dict, dtype)
+                param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
+                # Update weights corresponding to current block
+                block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+                can_dequantize = quant_utils.can_dequantize_from_fp8(block_state_dict)
+            # Dequantize weights corresponding to current block
+            quant_utils.dequantize_state_dict(block_state_dict, dtype)
 
         # Put block onto GPU
         block.to_empty(device=device)
@@ -375,8 +335,8 @@ def main():
             num_issue_non_invertible += handle.issue_non_invertible
 
             if args.log_error:
-                weight = handle.layer.weight.float()
-                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight.float(), weight, handle.H)
+                weight = handle.layer.weight
+                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight)
                 dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                 if args.log_wandb and dist_utils.is_main():
                     wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)

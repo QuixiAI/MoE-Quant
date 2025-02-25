@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -6,7 +7,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-__all__ = ["QLinear"]
+FP8_GROUP_SIZE = 128
+FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 
 
 def pack4to8(x: Tensor):
@@ -154,6 +156,49 @@ def dequantize_linear_weight(
     return weight   
 
 
-def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor):
+def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: Optional[torch.Tensor] = None):
     delta = q - w
-    return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
+    if H is None:
+        return delta.pow(2).mean() / w.pow(2).mean()
+    else:
+        return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
+
+
+def dequantize_weight_from_fp8(W, s):
+    g = FP8_GROUP_SIZE
+    # Dequantize weight
+    d_out, d_in = W.shape
+    # Pad weight if needed
+    pad_out = math.ceil(d_out / g) * g - d_out
+    pad_in = math.ceil(d_in / g) * g - d_in
+    W = F.pad(W, (0, pad_in, 0, pad_out))
+    d_out_pad, d_in_pad = W.shape
+
+    W = W.view(d_out_pad // g, g, d_in_pad // g, g) 
+    s = s.view(d_out_pad // g, 1, d_in_pad // g, 1)
+    W = (W * s).view(d_out_pad, d_in_pad)
+
+    # Remove padding
+    W = W[:d_out, :d_in]
+    return W
+
+
+def dequantize_state_dict(state_dict: dict[str, torch.Tensor], dtype: torch.dtype = torch.float16) -> None:
+    state_dict_keys = list(state_dict.keys())
+    # Dequantize
+    for k in state_dict_keys:
+        if k.endswith("scale_inv"):
+            layer_name, _ = k.rsplit(".", 1)
+
+            W = state_dict[f"{layer_name}.weight"].to(dtype) 
+            s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype) 
+
+            state_dict[f"{layer_name}.weight"] = dequantize_weight_from_fp8(W, s)
+            del state_dict[f"{layer_name}.weight_scale_inv"]
+
+
+def can_dequantize_from_fp8(state_dict: dict[str, torch.Tensor]) -> bool:
+    for k, v in state_dict.items():
+        if v.dtype in FP8_DTYPES and f"{k}_scale_inv" not in state_dict:
+            return False
+    return True
