@@ -37,9 +37,9 @@ def is_main():
     return get_rank() == 0
 
 
-def barrier():
+def barrier(device_ids=None):
     if is_dist_available_and_initialized():
-        dist.barrier()
+        dist.barrier(device_ids=device_ids)
 
 
 def broadcast_parameters(module: nn.Module, src: Any = 0, group: Optional[Any] = None):

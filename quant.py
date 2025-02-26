@@ -121,6 +121,11 @@ def parse_args():
         help="whether to offload activations to CPU."
     )
     parser.add_argument(
+        "--no_weight_update", 
+        action="store_true", 
+        help="whether to skip weight update after quantization."
+    )
+    parser.add_argument(
         "--seed", 
         default=0, 
         type=int, 
@@ -187,7 +192,7 @@ def main():
     # Take slices (if running on multiple workers)
     num_seq_per_rank = len(calibration_dataset) // world_size
     calibration_dataset = calibration_dataset[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
-    dist_utils.barrier()
+    dist_utils.barrier(device_ids=[rank])
 
     # Load initial weight shard
     weight_dir = args.model_name_or_path
@@ -197,7 +202,7 @@ def main():
     param_buffer = {}
     if dist_utils.is_main():
         param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
-    dist_utils.barrier()
+    dist_utils.barrier(device_ids=[rank])
         
     # Prepare input embedding
     inputs = []
@@ -313,7 +318,7 @@ def main():
         for _, h in hooks.items():
             h.remove()
 
-        dist_utils.barrier()
+        dist_utils.barrier(device_ids=[rank])
  
         shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
         expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
@@ -348,7 +353,8 @@ def main():
                     os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
                 )
             # Replace original weight by quantized one
-            handle.layer.weight.data = dequantized_weight
+            if not args.no_weight_update:
+                handle.layer.weight.data = dequantized_weight
             # Destroy handle
             handle.reset()
 
@@ -379,8 +385,8 @@ def main():
                 num_issue_non_invertible += handle.issue_non_invertible
 
                 if args.log_error:
-                    weight = handle.layer.weight.float()
-                    relative_mse = quant_utils.get_relative_mse_error(dequantized_weight.float(), weight, handle.H)
+                    weight = handle.layer.weight
+                    relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight)
                     dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                     if args.log_wandb and dist_utils.is_main():
                         wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
@@ -392,11 +398,12 @@ def main():
                         os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
                     )
                 # Replace original weight by quantized one
-                handle.layer.weight.data = dequantized_weight
+                if not args.no_weight_update:
+                    handle.layer.weight.data = dequantized_weight
                 # Destroy handle
                 handle.reset()
 
-            dist_utils.barrier()
+            dist_utils.barrier(device_ids=[rank])
 
             dist_utils.print_on_main("-" * 10)
             dist_utils.print_on_main(f"GPTQ calibration issues for expert modules:")
@@ -408,6 +415,7 @@ def main():
         # Update activations
         for i in range(num_seq_per_rank):
             inputs[i] = block(inputs[i].to(device))[0].to(offload_device)
+            assert torch.isfinite(inputs[i]).all().item(), "NaN of inf encountered."
 
         # Offload block
         block.to(device="meta")
