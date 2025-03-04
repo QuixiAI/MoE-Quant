@@ -47,6 +47,7 @@ class GPTQ:
         # init hessian
         self.H = None
         self.num_samples = 0
+        self.tokens_collected = 0
         self.is_distributed = is_distributed
         # Flags indicating issues
         self.issue_zero_samples = False
@@ -56,6 +57,9 @@ class GPTQ:
     @staticmethod
     def _validate_layer(layer):
         assert isinstance(layer, (nn.Linear, _ConvNd)), "OBC supports only linear and convolutional layers."
+
+    def has_hessian_issues(self) -> bool:
+        return any([self.issue_zero_samples, self.issue_nan_hessian, self.issue_non_invertible])
 
     # preparatory methods
     @torch.no_grad()
@@ -91,6 +95,7 @@ class GPTQ:
         self.H.addmm_(input.T, input, beta=beta, alpha=alpha)
         # update number of collected samples
         self.num_samples += batch_size
+        self.tokens_collected += input.shape[0]
 
     def reset(self) -> None:
         self.W = self.layer.weight
@@ -143,7 +148,10 @@ class GPTQ:
             self.W.data = self.W[:, perm]
             self.H.data = self.H[perm, :][:, perm]
 
-        if dist_utils.is_main():
+        # TODO a nicer way to implement this?
+        is_main_gptq_process = dist_utils.is_main() or not self.is_distributed
+
+        if is_main_gptq_process:
             # prepare weight and Cholesky of H^{-1}
             w, H_inv_cho= self._prepare()
 

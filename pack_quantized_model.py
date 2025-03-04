@@ -66,6 +66,12 @@ def parse_args():
         action="store_true",
         help="Fit a unique quantizer to each output dim",
     )
+    parser.add_argument(
+        "--quantize_only_experts", 
+        default=False, 
+        action="store_true", 
+        help="Whether to quantize only routed (non-shared) experts."
+    )
      # Misc params
     parser.add_argument(
         "--dtype", 
@@ -106,7 +112,7 @@ def pack_weight(
 def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
     ignored_modules = ["lm_head"]
     if args.quantize_only_experts:
-        ignored_modules += ["re:.*self_attn.*", "re:.*shared_experts.*"]
+        ignored_modules += ["re:.*self_attn.*", "re:.*shared_experts.*", "re:.*mlp\.(gate|up|down)_proj.*"]
     return {
         "config_groups": {
             "group_0": {

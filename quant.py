@@ -126,6 +126,11 @@ def parse_args():
         help="whether to skip weight update after quantization."
     )
     parser.add_argument(
+        "--resume", 
+        action="store_true", 
+        help="whether to resume quantization from latest checkpoint."
+    )
+    parser.add_argument(
         "--seed", 
         default=0, 
         type=int, 
@@ -144,6 +149,15 @@ def parse_args():
 
 def is_subset(set1: set, set2: set):
     return set1 <= set2
+
+
+def get_resume_block_idx(save_dir: os.PathLike) -> int:
+    resume_block_idx = 0
+    if os.path.exists(save_dir):
+        for layer_name in os.listdir(save_dir):
+            block_idx = int(layer_name.split(".")[2])
+            resume_block_idx = max(resume_block_idx, block_idx)
+    return resume_block_idx
 
 
 def main():
@@ -203,16 +217,24 @@ def main():
     if dist_utils.is_main():
         param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
     dist_utils.barrier(device_ids=[rank])
+
+    # Get resume block id
+    resume_block_idx = 0
+    if args.resume:
+        resume_block_idx = get_resume_block_idx(args.save_dir)
         
-    # Prepare input embedding
+    # Prepare input embeddings and position ids
     inputs = []
+    position_ids = []
     model.model.embed_tokens.to_empty(device=device)
     if dist_utils.is_main():
         model.model.embed_tokens.weight.data = param_buffer["model.embed_tokens.weight"].to(device=device, dtype=dtype)
     if dist_utils.is_dist_available_and_initialized():
         dist_utils.broadcast_parameters(model.model.embed_tokens)
     for i in range(num_seq_per_rank):
+        seq_length = calibration_dataset[i].shape[1]
         inputs.append(model.model.embed_tokens(calibration_dataset[i].to(device)).to(offload_device))
+        position_ids.append(torch.arange(0, seq_length, dtype=torch.long, device=device).unsqueeze(0))
     # Offload embeddings back to meta
     model.model.embed_tokens.to(device="meta")
     param_buffer.pop("model.embed_tokens.weight", None)
@@ -277,7 +299,7 @@ def main():
                         dist.send(rank_state_dict[k].to(device), dst=i)
             else:
                 rank_state_dict = block.state_dict()
-                for k in block.state_dict():
+                for k in rank_state_dict:
                     dist.recv(rank_state_dict[k], src=0)
                 block.load_state_dict(rank_state_dict)
             del rank_state_dict
@@ -285,113 +307,76 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()  
 
-        # Hessian estimate
-        layers = model_utils.select_layers(model, prefix, ".*", model_utils.LINEAR_LAYERS)
-        handles = {}
-        hooks = {}
+        if block_idx >= resume_block_idx:
+            # Hessian estimate
+            layers = model_utils.select_layers(model, prefix, ".*", model_utils.LINEAR_LAYERS)
+            handles = {}
+            hooks = {}
 
-        for layer_name, layer in layers.items():
-            def update_handle_hook(name):
-                def _hook(_, inp, out):
-                    handles[name].update(inp[0])
-                return _hook
+            for layer_name, layer in layers.items():
+                def update_handle_hook(name):
+                    def _hook(_, inp, out):
+                        handles[name].update(inp[0])
+                    return _hook
 
-            if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
-                continue
+                if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
+                    continue
 
-            handles[layer_name] = gptq.GPTQ(
-                layer,
-                args.perchannel,
-                args.group_size,
-                args.sym,
-                args.rel_damp,
-                args.block_size,
-                args.act_order,
-                is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None
-            )
-            hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
-
-        # Collect Hessians
-        for i in range(num_seq_per_rank):
-            block(inputs[i].to(device))
-
-        for _, h in hooks.items():
-            h.remove()
-
-        dist_utils.barrier(device_ids=[rank])
- 
-        shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
-        expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
-
-        # Quantized shared handles first
-        num_issue_zero_samples = 0
-        num_issue_nan_hessian = 0
-        num_issue_non_invertible = 0
-        for handle_name, handle in shared_handles.items():
-            dist_utils.print_on_main(f"Quantizing layer {handle_name}")
-            qweight, scale, zero, perm = handle.quantize(args.bits)
-            # Construct dequantized weight
-            dequantized_weight = quant_utils.dequantize_linear_weight(
-                qweight, scale, zero, perm
-            )
-            # Update issue tracker
-            num_issue_zero_samples += handle.issue_zero_samples
-            num_issue_nan_hessian += handle.issue_nan_hessian
-            num_issue_non_invertible += handle.issue_non_invertible
-
-            if args.log_error:
-                weight = handle.layer.weight
-                relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight)
-                dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
-                if args.log_wandb and dist_utils.is_main():
-                    wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
-
-            if args.save_dir and dist_utils.is_main():
-                os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
-                torch.save(
-                    {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
-                    os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                handles[layer_name] = gptq.GPTQ(
+                    layer,
+                    args.perchannel,
+                    args.group_size,
+                    args.sym,
+                    args.rel_damp,
+                    args.block_size,
+                    args.act_order,
+                    is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None
                 )
-            # Replace original weight by quantized one
-            if not args.no_weight_update:
-                handle.layer.weight.data = dequantized_weight
-            # Destroy handle
-            handle.reset()
+                hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
-        dist_utils.print_on_main("-" * 10)
-        dist_utils.print_on_main(f"GPTQ calibration issues for shared modules:")
-        dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
-        dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
-        dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
-        dist_utils.print_on_main("-" * 10)
+            # Collect Hessians
+            for i in range(num_seq_per_rank):
+                block(inputs[i].to(device), position_ids=position_ids[i])
 
-        # Quantize experts
-        num_issue_zero_samples = 0
-        num_issue_nan_hessian = 0
-        num_issue_non_invertible = 0
-        if len(expert_handles) > 0:
-            dist_utils.print_on_main(f"Processing experts")
+            for _, h in hooks.items():
+                h.remove()
 
-            for handle_name, handle in expert_handles.items():
+            dist_utils.barrier(device_ids=[rank])
+    
+            shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
+            expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
+
+            # Quantized shared handles first
+            num_issue_zero_samples = 0
+            num_issue_nan_hessian = 0
+            num_issue_non_invertible = 0
+            for handle_name, handle in shared_handles.items():
                 dist_utils.print_on_main(f"Quantizing layer {handle_name}")
                 qweight, scale, zero, perm = handle.quantize(args.bits)
                 # Construct dequantized weight
                 dequantized_weight = quant_utils.dequantize_linear_weight(
                     qweight, scale, zero, perm
                 )
+                assert torch.isfinite(dequantized_weight).all().item(), f"[rank{rank}] {handle_name} weight is broken after quantization."
                 # Update issue tracker
                 num_issue_zero_samples += handle.issue_zero_samples
                 num_issue_nan_hessian += handle.issue_nan_hessian
                 num_issue_non_invertible += handle.issue_non_invertible
 
                 if args.log_error:
-                    weight = handle.layer.weight
-                    relative_mse = quant_utils.get_relative_mse_error(dequantized_weight, weight)
-                    dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
-                    if args.log_wandb and dist_utils.is_main():
-                        wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
+                    if handle.has_hessian_issues():
+                        dist_utils.print_on_main("An issue occured on Hessian computation. Output error cannot be estimated.")
+                    else:
+                        relative_mse = quant_utils.get_relative_mse_error(
+                            dequantized_weight.float(), 
+                            handle.layer.weight.float(), 
+                            handle.H
+                        )
+                        dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
+                        if args.log_wandb and dist_utils.is_main():
+                            wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
 
-                if args.save_dir:
+                if args.save_dir and dist_utils.is_main():
                     os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
                     torch.save(
                         {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
@@ -403,18 +388,91 @@ def main():
                 # Destroy handle
                 handle.reset()
 
-            dist_utils.barrier(device_ids=[rank])
-
             dist_utils.print_on_main("-" * 10)
-            dist_utils.print_on_main(f"GPTQ calibration issues for expert modules:")
+            dist_utils.print_on_main(f"GPTQ calibration issues for shared modules:")
             dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
             dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
             dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
             dist_utils.print_on_main("-" * 10)
 
+            # Quantize experts
+            num_issue_zero_samples = 0
+            num_issue_nan_hessian = 0
+            num_issue_non_invertible = 0
+            if len(expert_handles) > 0:
+                dist_utils.print_on_main(f"Processing experts")
+
+                expert_messages = None
+                if dist_utils.is_main():
+                    expert_messages = [None for _ in range(world_size)]
+                rank_expert_message = ""
+
+                for handle_name, handle in expert_handles.items():
+                    rank_expert_message += f"Quantizing layer {handle_name}\n"
+                    qweight, scale, zero, perm = handle.quantize(args.bits)
+                    # Construct dequantized weight
+                    dequantized_weight = quant_utils.dequantize_linear_weight(
+                        qweight, scale, zero, perm
+                    )
+                    assert torch.isfinite(dequantized_weight).all().item(), f"[rank{rank}] {handle_name} weight is broken after quantization."
+                    # Update issue tracker
+                    num_issue_zero_samples += handle.issue_zero_samples
+                    num_issue_nan_hessian += handle.issue_nan_hessian
+                    num_issue_non_invertible += handle.issue_non_invertible
+
+                    rank_expert_message += f"Tokens collected: {handle.tokens_collected}.\n"
+
+                    if args.log_error:
+                        if handle.has_hessian_issues():
+                            rank_expert_message += "Hessian issue. Output error cannot be estimated.\n"
+                        else:
+                            relative_mse = quant_utils.get_relative_mse_error(
+                                dequantized_weight.float(), 
+                                handle.layer.weight.float(), 
+                                handle.H
+                            )
+                            rank_expert_message += f"Relative error: {relative_mse.item():.2e}\n"
+                            # TODO send to main process
+                            if args.log_wandb and dist_utils.is_main():
+                                wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
+
+                    if args.save_dir:
+                        os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
+                        torch.save(
+                            {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
+                            os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                        )
+                    # Replace original weight by quantized one
+                    if not args.no_weight_update:
+                        handle.layer.weight.data = dequantized_weight
+                    # Destroy handle
+                    handle.reset()
+
+                dist_utils.barrier(device_ids=[rank])
+
+                dist.gather_object(rank_expert_message, expert_messages)
+                if dist_utils.is_main():
+                    for expert_message in expert_messages:
+                        dist_utils.print_on_main(expert_message)
+
+                # TODO sync data from other processes
+                dist_utils.print_on_main("-" * 10)
+                dist_utils.print_on_main(f"GPTQ calibration issues for expert modules:")
+                dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
+                dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
+                dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+                dist_utils.print_on_main("-" * 10)
+
+            del handles
+            del shared_handles
+            del expert_handles
+            del hooks
+        else:
+            dist_utils.print_on_main(f"Block {block_idx} is already quantized. Skipping quantization.")
+
         # Update activations
         for i in range(num_seq_per_rank):
-            inputs[i] = block(inputs[i].to(device))[0].to(offload_device)
+            inputs[i] = block(inputs[i].to(device), position_ids=position_ids[i])[0].to(offload_device)
             assert torch.isfinite(inputs[i]).all().item(), "NaN of inf encountered."
 
         # Offload block
@@ -422,10 +480,6 @@ def main():
         for k in block_keys_with_prefix:
             param_buffer.pop(k, None)
             
-        del handles
-        del shared_handles
-        del expert_handles
-        del hooks
         torch.cuda.empty_cache()
         gc.collect()
     
