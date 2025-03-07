@@ -38,18 +38,8 @@ def parse_args():
         required=True,
         help="The name or path to calibration dataset",
     )
-    parser.add_argument(
-        "--num_calibration_samples", 
-        default=128, 
-        type=int, 
-        help="Number of samples for calibration."
-    )
-    parser.add_argument(
-        "--max_sequence_length", 
-        default=8192, 
-        type=int, 
-        help="Calibration sequence length."
-    )
+    parser.add_argument("--num_calibration_samples", default=128, type=int, help="Number of samples for calibration.")
+    parser.add_argument("--max_sequence_length", default=8192, type=int, help="Calibration sequence length.")
     # Quantization params
     parser.add_argument(
         "--bits",
@@ -63,85 +53,38 @@ def parse_args():
         default=None,
         help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
     )
-    parser.add_argument(
-        "--act_order",
-        action="store_true",
-        help="Whether to permute in activation order.",
-    )
-    parser.add_argument(
-        "--sym", 
-        action="store_true", 
-        help="Whether to use symmetric quantization"
-    )
+    parser.add_argument("--sym", action="store_true", help="Whether to use symmetric quantization")
     parser.add_argument(
         "--perchannel",
         action="store_true",
         help="Fit a unique quantizer to each output dim",
     )
+    parser.add_argument("--rel_damp", type=float, default=1e-2)
+    parser.add_argument("--block_size", type=int, default=128)
+    parser.add_argument("--quantization_scale", type=str, default="absmax", choices=["absmax", "mse"])
+    parser.add_argument("--quantization_order", type=str, default="default", choices=["default", "activation"])
     parser.add_argument(
-        "--rel_damp", 
-        type=float, 
-        default=1e-2
+        "--static_groups",
+        default=False,
+        action="store_true",
     )
     parser.add_argument(
-        "--block_size", 
-        type=int, 
-        default=128
-    )
-    parser.add_argument(
-        "--quantize_only_experts", 
-        default=False, 
-        action="store_true", 
-        help="Whether to quantize only routed (non-shared) experts."
+        "--quantize_only_experts",
+        default=False,
+        action="store_true",
+        help="Whether to quantize only routed (non-shared) experts.",
     )
     # Save params
-    parser.add_argument(
-        "--save_dir", 
-        type=str, 
-        default=None,
-        help="where to save quantized model."
-    )
+    parser.add_argument("--save_dir", type=str, default=None, help="where to save quantized model.")
     # Logging params
-    parser.add_argument(
-        "--log_wandb", 
-        default=False, 
-        action="store_true", 
-        help="Log to W&B"
-    )
-    parser.add_argument(
-        "--log_error", 
-        default=False, 
-        action="store_true", 
-        help="Whether to log relative L2 error"
-    )
+    parser.add_argument("--log_wandb", default=False, action="store_true", help="Log to W&B")
+    parser.add_argument("--log_error", default=False, action="store_true", help="Whether to log relative L2 error")
     # Misc params
+    parser.add_argument("--offload_activations", action="store_true", help="whether to offload activations to CPU.")
+    parser.add_argument("--resume", action="store_true", help="whether to resume quantization from latest checkpoint.")
+    parser.add_argument("--seed", default=0, type=int, help="Random seed.")
     parser.add_argument(
-        "--offload_activations", 
-        action="store_true", 
-        help="whether to offload activations to CPU."
-    )
-    parser.add_argument(
-        "--no_weight_update", 
-        action="store_true", 
-        help="whether to skip weight update after quantization."
-    )
-    parser.add_argument(
-        "--resume", 
-        action="store_true", 
-        help="whether to resume quantization from latest checkpoint."
-    )
-    parser.add_argument(
-        "--seed", 
-        default=0, 
-        type=int, 
-        help="Random seed."
-    )    
-    parser.add_argument(
-        "--dtype", 
-        default="float16", 
-        type=str,
-        choices=["float16", "bfloat16"], 
-        help="Torch dtype used."
+        "--dtype", default="float16", type=str, choices=["float16", "bfloat16"], help="Torch dtype used."
     )
     args = parser.parse_args()
     return args
@@ -173,7 +116,7 @@ def main():
     torch.cuda.set_device(device)
     offload_device = "cpu" if args.offload_activations else None
     dtype = getattr(torch, args.dtype)
-     # Init W&B logger
+    # Init W&B logger
     if args.log_wandb and dist_utils.is_main():
         wandb.init(config=args)
 
@@ -185,10 +128,7 @@ def main():
 
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            config=config,
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2",
-            torch_dtype=dtype
+            config=config, trust_remote_code=True, attn_implementation="flash_attention_2", torch_dtype=dtype
         ).eval()
         model.config.use_cache = False
 
@@ -196,11 +136,7 @@ def main():
 
     # Prepare calibration dataset
     calibration_dataset = data_utils.prepare_calibration_dataset(
-        args.dataset_name_or_path,
-        tokenizer,
-        args.max_sequence_length,
-        args.num_calibration_samples,
-        args.seed
+        args.dataset_name_or_path, tokenizer, args.max_sequence_length, args.num_calibration_samples, args.seed
     )
 
     # Take slices (if running on multiple workers)
@@ -222,7 +158,7 @@ def main():
     resume_block_idx = 0
     if args.resume:
         resume_block_idx = get_resume_block_idx(args.save_dir)
-        
+
     # Prepare input embeddings and position ids
     inputs = []
     position_ids = []
@@ -240,9 +176,7 @@ def main():
     param_buffer.pop("model.embed_tokens.weight", None)
 
     for block_idx, block in tqdm(
-        enumerate(model.model.layers), 
-        desc="Processing transformer blocks",
-        total=len(model.model.layers)
+        enumerate(model.model.layers), desc="Processing transformer blocks", total=len(model.model.layers)
     ):
         prefix = f"model.layers.{block_idx}."
 
@@ -259,20 +193,20 @@ def main():
             # Make it a set
             block_keys_with_prefix = set(block_keys_with_prefix)
         else:
-            block_keys_with_prefix  = []
+            block_keys_with_prefix = []
             other_ranks_keys = []
             dist.send_object_list(rank_block_keys, dst=0)
 
         if dist_utils.is_main():
             can_dequantize = True
             # Select weights corresponding to current block
-            block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+            block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
             while not (is_subset(block_keys_with_prefix, set(param_buffer.keys())) and can_dequantize):
                 current_shard_id += 1
                 weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
                 param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
                 # Update weights corresponding to current block
-                block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+                block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
                 can_dequantize = quant_utils.can_dequantize_from_fp8(block_state_dict)
             # Dequantize weights corresponding to current block
             quant_utils.dequantize_state_dict(block_state_dict, dtype)
@@ -281,7 +215,7 @@ def main():
         block.to_empty(device=device)
 
         # Simply load block state dict on master and broadcast
-        if block_idx < model.config.first_k_dense_replace:        
+        if block_idx < model.config.first_k_dense_replace:
             if dist_utils.is_main():
                 block.load_state_dict(block_state_dict)
             if dist_utils.is_dist_available_and_initialized():
@@ -305,7 +239,7 @@ def main():
             del rank_state_dict
         # Clear memory before calibration
         torch.cuda.empty_cache()
-        gc.collect()  
+        gc.collect()
 
         if block_idx >= resume_block_idx:
             # Hessian estimate
@@ -314,9 +248,11 @@ def main():
             hooks = {}
 
             for layer_name, layer in layers.items():
+
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
                         handles[name].update(inp[0])
+
                     return _hook
 
                 if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
@@ -329,8 +265,10 @@ def main():
                     args.sym,
                     args.rel_damp,
                     args.block_size,
-                    args.act_order,
-                    is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None
+                    args.quantization_order,
+                    args.quantization_scale,
+                    args.static_groups,
+                    is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
                 )
                 hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
@@ -342,7 +280,7 @@ def main():
                 h.remove()
 
             dist_utils.barrier(device_ids=[rank])
-    
+
             shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
             expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
 
@@ -352,12 +290,12 @@ def main():
             num_issue_non_invertible = 0
             for handle_name, handle in shared_handles.items():
                 dist_utils.print_on_main(f"Quantizing layer {handle_name}")
-                qweight, scale, zero, perm = handle.quantize(args.bits)
+                qweight, scale, zero = handle.quantize(args.bits)
                 # Construct dequantized weight
-                dequantized_weight = quant_utils.dequantize_linear_weight(
-                    qweight, scale, zero, perm
-                )
-                assert torch.isfinite(dequantized_weight).all().item(), f"[rank{rank}] {handle_name} weight is broken after quantization."
+                dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
+                assert (
+                    torch.isfinite(dequantized_weight).all().item()
+                ), f"[rank{rank}] {handle_name} weight is broken after quantization."
                 # Update issue tracker
                 num_issue_zero_samples += handle.issue_zero_samples
                 num_issue_nan_hessian += handle.issue_nan_hessian
@@ -365,12 +303,12 @@ def main():
 
                 if args.log_error:
                     if handle.has_hessian_issues():
-                        dist_utils.print_on_main("An issue occured on Hessian computation. Output error cannot be estimated.")
+                        dist_utils.print_on_main(
+                            "An issue occured on Hessian computation. Output error cannot be estimated."
+                        )
                     else:
                         relative_mse = quant_utils.get_relative_mse_error(
-                            dequantized_weight.float(), 
-                            handle.layer.weight.float(), 
-                            handle.H
+                            dequantized_weight.float(), handle.layer.weight.float(), handle.H
                         )
                         dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                         if args.log_wandb and dist_utils.is_main():
@@ -379,12 +317,11 @@ def main():
                 if args.save_dir and dist_utils.is_main():
                     os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
                     torch.save(
-                        {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
-                        os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                        {"qweight": qweight, "scale": scale, "zero": zero},
+                        os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
                     )
                 # Replace original weight by quantized one
-                if not args.no_weight_update:
-                    handle.layer.weight.data = dequantized_weight
+                handle.layer.weight.data = dequantized_weight
                 # Destroy handle
                 handle.reset()
 
@@ -409,12 +346,12 @@ def main():
 
                 for handle_name, handle in expert_handles.items():
                     rank_expert_message += f"Quantizing layer {handle_name}\n"
-                    qweight, scale, zero, perm = handle.quantize(args.bits)
+                    qweight, scale, zero = handle.quantize(args.bits)
                     # Construct dequantized weight
-                    dequantized_weight = quant_utils.dequantize_linear_weight(
-                        qweight, scale, zero, perm
-                    )
-                    assert torch.isfinite(dequantized_weight).all().item(), f"[rank{rank}] {handle_name} weight is broken after quantization."
+                    dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
+                    assert (
+                        torch.isfinite(dequantized_weight).all().item()
+                    ), f"[rank{rank}] {handle_name} weight is broken after quantization."
                     # Update issue tracker
                     num_issue_zero_samples += handle.issue_zero_samples
                     num_issue_nan_hessian += handle.issue_nan_hessian
@@ -427,9 +364,7 @@ def main():
                             rank_expert_message += "Hessian issue. Output error cannot be estimated.\n"
                         else:
                             relative_mse = quant_utils.get_relative_mse_error(
-                                dequantized_weight.float(), 
-                                handle.layer.weight.float(), 
-                                handle.H
+                                dequantized_weight.float(), handle.layer.weight.float(), handle.H
                             )
                             rank_expert_message += f"Relative error: {relative_mse.item():.2e}\n"
                             # TODO send to main process
@@ -439,12 +374,11 @@ def main():
                     if args.save_dir:
                         os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
                         torch.save(
-                            {"qweight": qweight, "scale": scale, "zero": zero, "perm": perm}, 
-                            os.path.join(args.save_dir, handle_name, f"quantized_weight.pt")
+                            {"qweight": qweight, "scale": scale, "zero": zero},
+                            os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
                         )
                     # Replace original weight by quantized one
-                    if not args.no_weight_update:
-                        handle.layer.weight.data = dequantized_weight
+                    handle.layer.weight.data = dequantized_weight
                     # Destroy handle
                     handle.reset()
 
@@ -479,10 +413,10 @@ def main():
         block.to(device="meta")
         for k in block_keys_with_prefix:
             param_buffer.pop(k, None)
-            
+
         torch.cuda.empty_cache()
         gc.collect()
-    
+
     dist.destroy_process_group()
 
 

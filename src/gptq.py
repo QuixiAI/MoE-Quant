@@ -1,4 +1,5 @@
-from typing import Tuple, Optional, List
+from enum import Enum
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,11 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 
+class QuantizationOrder(Enum):
+    DEFAULT = "default"
+    ACTIVATION = "activation"
+
+
 class GPTQ:
 
     def __init__(
@@ -23,9 +29,14 @@ class GPTQ:
         sym: bool = False,
         rel_damp: float = 1e-2,
         block_size: int = None,
-        act_order: bool = False,
+        quantization_order: str = "default",
+        quantization_scale: str = "absmax",
+        static_groups: bool = False,
         is_distributed: bool = False,
     ):
+        # Sanity checks
+        if quantization_order == "activation":
+            assert static_groups, "Activation order works only with static_groups."
         self._validate_layer(layer)
         self.layer = layer
         self.W = self.layer.weight
@@ -38,7 +49,9 @@ class GPTQ:
         # FastOBQ hyperparameters
         self.rel_damp = rel_damp
         self.block_size = block_size or self.d_col
-        self.act_order = act_order
+        self.quantization_order = QuantizationOrder(quantization_order)
+        self.quantization_scale = quantization_scale
+        self.static_groups = static_groups
         self.group_size = group_size
         # backup layer properties
         self.W_device = self.W.device
@@ -47,7 +60,6 @@ class GPTQ:
         # init hessian
         self.H = None
         self.num_samples = 0
-        self.tokens_collected = 0
         self.is_distributed = is_distributed
         # Flags indicating issues
         self.issue_zero_samples = False
@@ -70,8 +82,6 @@ class GPTQ:
         Args:
             input: batch of layer inputs
         """
-        # get batch size
-        batch_size = input.shape[0]
         # init hessian
         if self.H is None:
             self.H = torch.zeros((self.d_col, self.d_col), device=input.device, dtype=torch.float32)
@@ -89,13 +99,18 @@ class GPTQ:
             input = unfold(input)
             input = input.transpose(1, 2).flatten(0, 1)
         input = input.float()
+        # get number of samples (tokens) in batch
+        num_new_samples = input.shape[0]
         # hessian update
-        beta = self.num_samples / (self.num_samples + batch_size)
-        alpha = 2.0 / (self.num_samples + batch_size)
+        beta = self.num_samples / (self.num_samples + num_new_samples)
+        alpha = 2.0 / (self.num_samples + num_new_samples)
         self.H.addmm_(input.T, input, beta=beta, alpha=alpha)
         # update number of collected samples
-        self.num_samples += batch_size
-        self.tokens_collected += input.shape[0]
+        self.num_samples += num_new_samples
+
+    @property
+    def tokens_collected(self) -> int:
+        return self.num_samples
 
     def reset(self) -> None:
         self.W = self.layer.weight
@@ -142,32 +157,46 @@ class GPTQ:
         group_size = self.group_size or d_col
         num_groups = d_col // group_size
 
-        perm = None
-        if self.act_order:
-            perm = torch.argsort(torch.diag(self.H), descending=True)
-            self.W.data = self.W[:, perm]
-            self.H.data = self.H[perm, :][:, perm]
-
         # TODO a nicer way to implement this?
         is_main_gptq_process = dist_utils.is_main() or not self.is_distributed
 
         if is_main_gptq_process:
-            # prepare weight and Cholesky of H^{-1}
-            w, H_inv_cho= self._prepare()
-
+            w = self.W
             qweight = torch.empty(d_row, d_col, device=device, dtype=torch.uint8)
-            scale = torch.empty(d_row, num_groups, device=device, dtype=dtype)
-            zero = torch.empty(d_row, num_groups, device=device, dtype=dtype)
 
             # Configure quantizer
             quantizer = self.quantizer
-            quantizer.configure(bits=bits, perchannel=self.perchannel, sym=self.sym)
+            quantizer.configure(
+                bits=bits, perchannel=self.perchannel, sym=self.sym, quantization_scale=self.quantization_scale
+            )
 
+            # Init scales and zeros
             if not self.group_size:
-                quantizer.find_params(w, weight=True)
-                self.scale = quantizer.scale.to(dtype)
-                self.zero = quantizer.zero.to(zero.dtype)
+                scale, zero = quantizer.get_scale_and_zero(w)
+            elif self.static_groups:
+                scale, zero = [], []
+                for c in range(0, d_col, group_size):
+                    group_scale, group_zero = quantizer.get_scale_and_zero(w[:, c : c + group_size])
+                    scale.append(group_scale)
+                    zero.append(group_zero)
+                scale = torch.cat(scale, dim=1)
+                zero = torch.cat(zero, dim=1)
+            else:
+                scale = torch.empty(d_row, num_groups, device=device, dtype=dtype)
+                zero = torch.empty(d_row, num_groups, device=device, dtype=dtype)
 
+            # Get permutation
+            perm = None
+            group_idx = None
+            if self.quantization_order == QuantizationOrder.ACTIVATION:
+                perm = torch.argsort(torch.diag(self.H), descending=True)
+                self.W.data = self.W[:, perm]
+                self.H.data = self.H[perm, :][:, perm]
+                group_idx = torch.arange(num_groups, device=device).repeat_interleave(group_size)[perm]
+
+            # prepare weight and Cholesky of H^{-1}
+            H_inv_cho = self._prepare()
+            g_idx = 0
             # iterate over columns
             for c1 in range(0, d_col, block_size):
                 c2 = min(c1 + block_size, d_col)
@@ -181,32 +210,46 @@ class GPTQ:
                     w_ci = w_blk[:, i]
                     d = H_inv_cho_blk[i, i]
 
-                    if self.group_size and (c1 + i) % group_size == 0:
-                        quantizer.find_params(w[:, (c1 + i) : (c1 + i + group_size)], weight=True)
-                        scale[:, (c1 + i) // group_size] = quantizer.scale.flatten()
-                        zero[:, (c1 + i) // group_size] = quantizer.zero.flatten()
+                    if self.quantization_order == QuantizationOrder.ACTIVATION:
+                        g_idx = group_idx[c1 + i]
+                    else:
+                        g_idx = (c1 + i) // group_size
 
-                    q = quantizer.quantize(w_ci.unsqueeze(1))
-                    w_q = quantizer.dequantize(q).flatten()
+                    if not self.static_groups and self.group_size and (c1 + i) % group_size == 0:
+                        group_scale, group_zero = quantizer.get_scale_and_zero(w[:, (c1 + i) : (c1 + i + group_size)])
+                        scale[:, g_idx] = group_scale.flatten()
+                        zero[:, g_idx] = group_zero.flatten()
 
-                    qweight[:, c1 + i] = q.flatten()
+                    q = quant_utils.quantize(w_ci, scale[:, g_idx], zero[:, g_idx], quantizer.maxq)
+                    w_q = quant_utils.dequantize(
+                        q,
+                        scale[:, g_idx],
+                        zero[:, g_idx],
+                    )
+
+                    qweight[:, c1 + i] = q
                     err = (w_ci - w_q) / d
-                    losses_blk[:, i] = err**2
+                    losses_blk[:, i] = err.pow(2)
 
                     w[:, c1 + i] = w_q
                     w_blk[:, i:].addr_(err, H_inv_cho_blk[i, i:], alpha=-1)
                     errs[:, i] = err
                 # 3) update the weights after block
                 w[:, c2:].addmm_(errs, H_inv_cho[c1:c2, c2:], alpha=-1)
+
+            # Permute weight back (if needed)
+            if perm is not None:
+                invperm = torch.argsort(perm)
+                self.H = self.H[invperm, :][:, invperm]
+                qweight = qweight[:, invperm]
+
+            # Cast scale to target dtype
+            scale = scale.to(dtype)
+            zero = zero.to(dtype)
         else:
             qweight = torch.empty(d_row, d_col, device=device, dtype=torch.uint8)
             scale = torch.empty(d_row, num_groups, device=device, dtype=dtype)
             zero = torch.empty(d_row, num_groups, device=device, dtype=dtype)
-
-        # Restore Hessian order
-        if self.act_order:
-            invperm = torch.argsort(perm)
-            self.H = self.H[invperm, :][:, invperm]
 
         if self.is_distributed and dist_utils.is_dist_available_and_initialized():
             dist.barrier()
@@ -214,11 +257,11 @@ class GPTQ:
             dist.broadcast(scale, src=0)
             dist.broadcast(zero, src=0)
 
-        return qweight, scale, zero, perm
+        return qweight, scale, zero
 
-    def quantize(self, bitwidth_options) -> Tensor:
+    def quantize(self, bits: int) -> Tensor:
         self.quantization_pre_step()
-        return self.step(bitwidth_options)
+        return self.step(bits)
 
     @torch.no_grad()
     def _prepare(self):
@@ -237,5 +280,4 @@ class GPTQ:
         except:
             H_inv_cho = torch.eye(self.d_col, device=H.device, dtype=torch.float32)
             self.issue_non_invertible = True
-        return w, H_inv_cho
-    
+        return H_inv_cho

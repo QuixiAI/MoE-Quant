@@ -1,14 +1,19 @@
 import math
-from typing import Optional
+from enum import Enum
+from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 
 FP8_GROUP_SIZE = 128
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+
+
+class QuantizationScale(Enum):
+    ABSMAX = "absmax"
+    MSE = "mse"
 
 
 def pack4to8(x: Tensor):
@@ -33,52 +38,38 @@ def dequantize(x, scale, zero):
     return scale * (x - zero)
 
 
-class Quantizer(nn.Module):
-    def __init__(self, shape=1):
-        super(Quantizer, self).__init__()
-        self.register_buffer("maxq", torch.tensor(0))
-        self.register_buffer("scale", torch.zeros(shape))
-        self.register_buffer("zero", torch.zeros(shape))
+class Quantizer:
+
+    def __init__(self):
+        super().__init__()
 
     def configure(
         self,
         bits,
         perchannel=False,
         sym=True,
-        norm=2.0,
-        grid=100,
-        maxshrink=0.8,
-        reserved_bins: int = 0,
+        # Scale search parameters
+        quantization_scale: str = "absmax",
+        scale_search_iters: int = 100,
     ):
         self.bits = bits
-        self.maxq = torch.tensor(2**bits - 1 - reserved_bins)
+        self.maxq = 2**bits - 1
         self.perchannel = perchannel
         self.sym = sym
-        self.norm = norm
-        self.grid = grid
-        self.maxshrink = maxshrink
+        # Scale search parameters
+        self.quantization_scale = QuantizationScale(quantization_scale)
+        self.scale_search_iters = scale_search_iters
 
-    def find_params(self, x, weight=False):
-        dev = x.device
-        self.maxq = self.maxq.to(dev)
+    def get_scale_and_zero(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_rows = x.shape[0]
 
-        shape = x.shape
         if self.perchannel:
-            if weight:
-                x = x.flatten(1)
-            else:
-                if len(shape) == 4:
-                    x = x.permute([1, 0, 2, 3])
-                    x = x.flatten(1)
-                if len(shape) == 3:
-                    x = x.reshape((-1, shape[-1])).t()
-                if len(shape) == 2:
-                    x = x.t()
+            x = x.flatten(1)
         else:
             x = x.flatten().unsqueeze(0)
 
-        xmin = x.min(1).values
-        xmax = x.max(1).values
+        xmin = x.min(dim=1, keepdim=True).values
+        xmax = x.max(dim=1, keepdim=True).values
 
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
@@ -89,62 +80,30 @@ class Quantizer(nn.Module):
         xmin[tmp] = -1
         xmax[tmp] = +1
 
-        self.scale = (xmax - xmin) / self.maxq
+        scale = (xmax - xmin) / self.maxq
         if self.sym:
-            self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
+            zero = torch.full_like(scale, (self.maxq + 1) / 2)
         else:
-            self.zero = torch.round(-xmin / self.scale)
+            zero = torch.round(-xmin / scale)
+
+        if self.quantization_scale == QuantizationScale.MSE:
+            for _ in range(self.scale_search_iters):
+                q = quantize(x, scale, zero, self.maxq)
+                delta = q - zero
+                scale = x.mul(delta).mean(dim=1, keepdim=True) / delta.pow(2).mean(dim=1, keepdim=True)
 
         if not self.perchannel:
-            if weight:
-                tmp = shape[0]
-            else:
-                tmp = shape[1] if len(shape) != 3 else shape[2]
-            self.scale = self.scale.repeat(tmp)
-            self.zero = self.zero.repeat(tmp)
+            scale = scale.expand((num_rows, 1))
+            zero = zero.expand((num_rows, 1))
 
-        if weight:
-            shape = [-1] + [1] * (len(shape) - 1)
-            self.scale = self.scale.reshape(shape)
-            self.zero = self.zero.reshape(shape)
-            return
-        if len(shape) == 4:
-            self.scale = self.scale.reshape((1, -1, 1, 1))
-            self.zero = self.zero.reshape((1, -1, 1, 1))
-        if len(shape) == 3:
-            self.scale = self.scale.reshape((1, 1, -1))
-            self.zero = self.zero.reshape((1, 1, -1))
-        if len(shape) == 2:
-            self.scale = self.scale.unsqueeze(0)
-            self.zero = self.zero.unsqueeze(0)
-
-    def quantize_dequantize(self, x):
-        if self.ready():
-            return quantize_dequantize(x, self.scale, self.zero, self.maxq)
-        return x
-
-    def quantize(self, x):
-        if self.ready():
-            return quantize(x, self.scale, self.zero, self.maxq)
-        return x
-
-    def dequantize(self, x):
-        if self.ready():
-            return dequantize(x, self.scale, self.zero)
-        return x
-
-    def enabled(self):
-        return self.maxq > 0
-
-    def ready(self):
-        return torch.all(self.scale != 0)
+        return scale, zero
 
 
 def dequantize_linear_weight(
-    qweight: torch.Tensor, 
-    scale: torch.Tensor, 
-    zero: torch.Tensor, 
-    perm: Optional[torch.Tensor] = None, 
+    qweight: torch.Tensor,
+    scale: torch.Tensor,
+    zero: torch.Tensor,
+    perm: Optional[torch.Tensor] = None,
 ):
     scale = scale.view(qweight.shape[0], -1, 1)
     zero = zero.view(qweight.shape[0], -1, 1)
@@ -152,8 +111,8 @@ def dequantize_linear_weight(
     weight = dequantize(qweight.view(qweight.shape[0], num_groups, -1), scale, zero).view_as(qweight)
     if perm is not None:
         invperm = perm.argsort()
-        weight =weight[:, invperm]
-    return weight   
+        weight = weight[:, invperm]
+    return weight
 
 
 def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: Optional[torch.Tensor] = None):
@@ -174,7 +133,7 @@ def dequantize_weight_from_fp8(W, s):
     W = F.pad(W, (0, pad_in, 0, pad_out))
     d_out_pad, d_in_pad = W.shape
 
-    W = W.view(d_out_pad // g, g, d_in_pad // g, g) 
+    W = W.view(d_out_pad // g, g, d_in_pad // g, g)
     s = s.view(d_out_pad // g, 1, d_in_pad // g, 1)
     W = (W * s).view(d_out_pad, d_in_pad)
 
@@ -190,8 +149,8 @@ def dequantize_state_dict(state_dict: dict[str, torch.Tensor], dtype: torch.dtyp
         if k.endswith("scale_inv"):
             layer_name, _ = k.rsplit(".", 1)
 
-            W = state_dict[f"{layer_name}.weight"].to(dtype) 
-            s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype) 
+            W = state_dict[f"{layer_name}.weight"].to(dtype)
+            s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype)
 
             state_dict[f"{layer_name}.weight"] = dequantize_weight_from_fp8(W, s)
             del state_dict[f"{layer_name}.weight_scale_inv"]
