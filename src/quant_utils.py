@@ -8,6 +8,7 @@ from torch import Tensor
 
 
 FP8_GROUP_SIZE = 128
+TERNARY_BITWIDTH = 1.585
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 
 
@@ -53,7 +54,7 @@ class Quantizer:
         scale_search_iters: int = 100,
     ):
         self.bits = bits
-        self.maxq = 2**bits - 1
+        self.maxq = int(2 ** bits - 1)
         self.perchannel = perchannel
         self.sym = sym
         # Scale search parameters
@@ -62,14 +63,15 @@ class Quantizer:
 
     def get_scale_and_zero(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_rows = x.shape[0]
+        eps = torch.finfo(x.dtype).eps
 
         if self.perchannel:
             x = x.flatten(1)
         else:
             x = x.flatten().unsqueeze(0)
 
-        xmin = x.min(dim=1, keepdim=True).values
-        xmax = x.max(dim=1, keepdim=True).values
+        xmin = x.amin(dim=1, keepdim=True)
+        xmax = x.amax(dim=1, keepdim=True)
 
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
@@ -90,7 +92,7 @@ class Quantizer:
             for _ in range(self.scale_search_iters):
                 q = quantize(x, scale, zero, self.maxq)
                 delta = q - zero
-                scale = x.mul(delta).mean(dim=1, keepdim=True) / delta.pow(2).mean(dim=1, keepdim=True)
+                scale = x.mul(delta).mean(dim=1, keepdim=True) / (delta.pow(2).mean(dim=1, keepdim=True) + eps)
 
         if not self.perchannel:
             scale = scale.expand((num_rows, 1))

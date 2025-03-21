@@ -33,6 +33,7 @@ class GPTQ:
         quantization_scale: str = "absmax",
         static_groups: bool = False,
         is_distributed: bool = False,
+        tied_gptq_handle: Optional["GPTQ"] = None
     ):
         # Sanity checks
         if quantization_order == "activation":
@@ -61,6 +62,10 @@ class GPTQ:
         self.H = None
         self.num_samples = 0
         self.is_distributed = is_distributed
+        self.tied_gptq_handle = tied_gptq_handle
+        self.num_tied_handles = 0
+        if tied_gptq_handle is not None:
+            tied_gptq_handle.num_tied_handles += 1
         # Flags indicating issues
         self.issue_zero_samples = False
         self.issue_nan_hessian = False
@@ -114,7 +119,12 @@ class GPTQ:
 
     def reset(self) -> None:
         self.W = self.layer.weight
-        self.H = None
+        if self.num_tied_handles == 0:
+            self.H = None
+        elif self.tied_gptq_handle:
+            self.tied_gptq_handle.num_tied_handles -= 1
+            if self.tied_gptq_handle.num_tied_handles == 0:
+                self.tied_gptq_handle.H = None
         self.num_samples = 0
         torch.cuda.empty_cache()
 
@@ -124,11 +134,17 @@ class GPTQ:
         Preparatory step with hessian regularization and weight reshaping.
         """
         # 1) Hessian preparation
+        reduce_if_needed = True
         if self.H is None:
-            self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
-            self.issue_zero_samples = True
+            if self.tied_gptq_handle:
+                self.H = self.tied_gptq_handle.H
+            else:
+                self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
+                self.issue_zero_samples = True
+            # No need to reduce
+            reduce_if_needed = False
         # synchronize Hessians
-        if self.is_distributed and dist_utils.is_dist_available_and_initialized():
+        if self.is_distributed and reduce_if_needed and dist_utils.is_dist_available_and_initialized():
             dist.all_reduce(self.H, op=dist.ReduceOp.AVG)
         # Replace matrix by identity in case of NaNs
         if torch.isnan(self.H).any().item():
@@ -137,9 +153,6 @@ class GPTQ:
         # get ids of pruned channels
         pruned_ids = torch.diag(self.H) == 0
         self.H[pruned_ids, pruned_ids] = 1
-        # Hessian regularization
-        damp = self.rel_damp * torch.diag(self.H).mean()
-        self.H[range(self.d_col), range(self.d_col)] += damp
         # 2) Weight preparation
         # copy weight, flatten
         self.W = self.W.clone().float()
@@ -150,7 +163,7 @@ class GPTQ:
         self.pre_step_completed = True
 
     @torch.no_grad()
-    def step(self, bits: int) -> Tensor:
+    def step(self, bits: int | float) -> Tensor:
         # 1) define constants and chunk
         d_row, d_col, block_size, device, dtype = self.d_row, self.d_col, self.block_size, self.W_device, self.W_dtype
         # get quantization group size
@@ -191,7 +204,9 @@ class GPTQ:
             if self.quantization_order == QuantizationOrder.ACTIVATION:
                 perm = torch.argsort(torch.diag(self.H), descending=True)
                 self.W.data = self.W[:, perm]
-                self.H.data = self.H[perm, :][:, perm]
+                # If reusing hessian from other handle, Hessian is already permuted
+                if not self.tied_gptq_handle:
+                    self.H.data = self.H[perm, :][:, perm]
                 group_idx = torch.arange(num_groups, device=device).repeat_interleave(group_size)[perm]
 
             # prepare weight and Cholesky of H^{-1}
@@ -259,7 +274,7 @@ class GPTQ:
 
         return qweight, scale, zero
 
-    def quantize(self, bits: int) -> Tensor:
+    def quantize(self, bits: int | float) -> Tensor:
         self.quantization_pre_step()
         return self.step(bits)
 
@@ -273,6 +288,9 @@ class GPTQ:
         H[zero_cols, :] = 0
         H[:, zero_cols] = 0
         H[zero_cols, zero_cols] = 1
+        # Hessian regularization
+        damp = self.rel_damp * torch.diag(H).mean()
+        H[range(self.d_col), range(self.d_col)] += damp
         # invert
         try:
             H = linalg_utils.inv_sym(H)

@@ -20,6 +20,7 @@ from src import gptq
 
 
 ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
+TIED_FFN_GROUPS = ("gate_proj", "up_proj")
 
 
 def parse_args():
@@ -43,7 +44,7 @@ def parse_args():
     # Quantization params
     parser.add_argument(
         "--bits",
-        type=int,
+        type=float,
         required=True,
         help="Quantization bitwidth.",
     )
@@ -81,12 +82,19 @@ def parse_args():
     parser.add_argument("--log_error", default=False, action="store_true", help="Whether to log relative L2 error")
     # Misc params
     parser.add_argument("--offload_activations", action="store_true", help="whether to offload activations to CPU.")
+    parser.add_argument("--tie_gptq_handles", action="store_true", help="whether to reuse hessian between gate and up projections.")
     parser.add_argument("--resume", action="store_true", help="whether to resume quantization from latest checkpoint.")
     parser.add_argument("--seed", default=0, type=int, help="Random seed.")
     parser.add_argument(
-        "--dtype", default="float16", type=str, choices=["float16", "bfloat16"], help="Torch dtype used."
+        "--dtype", default="float16", type=str, choices=["float16s", "bfloat16"], help="Torch dtype used."
     )
     args = parser.parse_args()
+    # Bitwidth check
+    if args.bits.is_integer():
+        args.bits = int(args.bits)
+    else:
+        assert args.bits == quant_utils.TERNARY_BITWIDTH, "Only ternary quantization is supported for non-integer bitwidths."
+
     return args
 
 
@@ -258,6 +266,12 @@ def main():
                 if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
                     continue
 
+                tied_gptq_handle = None
+                if args.tie_gptq_handles and layer_name.endswith("up_proj"):
+                    parent_name, _ = layer_name.rsplit(".", 1)
+                    tied_layer_name = f"{parent_name}.gate_proj"
+                    tied_gptq_handle = handles[tied_layer_name]
+
                 handles[layer_name] = gptq.GPTQ(
                     layer,
                     args.perchannel,
@@ -269,8 +283,11 @@ def main():
                     args.quantization_scale,
                     args.static_groups,
                     is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
-                )
-                hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
+                    tied_gptq_handle=tied_gptq_handle
+                )    
+
+                if tied_gptq_handle is None:
+                    hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
             # Collect Hessians
             for i in range(num_seq_per_rank):
@@ -401,6 +418,8 @@ def main():
             del shared_handles
             del expert_handles
             del hooks
+            torch.cuda.empty_cache()
+            gc.collect()
         else:
             dist_utils.print_on_main(f"Block {block_idx} is already quantized. Skipping quantization.")
 
