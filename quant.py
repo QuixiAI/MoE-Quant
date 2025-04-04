@@ -8,15 +8,15 @@ import torch
 import torch.distributed as dist
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-import wandb
+
+try:
+    import wandb
+    wandb_enabled = True
+except:
+    wandb_enabled = False
 
 
-from src import dist_utils
-from src import data_utils
-from src import model_utils
-from src import quant_utils
-from src import loading_utils
-from src import gptq
+from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq
 
 
 ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
@@ -44,8 +44,9 @@ def parse_args():
     # Quantization params
     parser.add_argument(
         "--bits",
-        type=float,
-        required=True,
+        type=int,
+        default=4,
+        choices=[4],
         help="Quantization bitwidth.",
     )
     parser.add_argument(
@@ -55,20 +56,10 @@ def parse_args():
         help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
     )
     parser.add_argument("--sym", action="store_true", help="Whether to use symmetric quantization")
-    parser.add_argument(
-        "--perchannel",
-        action="store_true",
-        help="Fit a unique quantizer to each output dim",
-    )
     parser.add_argument("--rel_damp", type=float, default=1e-2)
     parser.add_argument("--block_size", type=int, default=128)
     parser.add_argument("--quantization_scale", type=str, default="absmax", choices=["absmax", "mse"])
     parser.add_argument("--quantization_order", type=str, default="default", choices=["default", "activation"])
-    parser.add_argument(
-        "--static_groups",
-        default=False,
-        action="store_true",
-    )
     parser.add_argument(
         "--quantize_only_experts",
         default=False,
@@ -89,11 +80,6 @@ def parse_args():
         "--dtype", default="float16", type=str, choices=["float16s", "bfloat16"], help="Torch dtype used."
     )
     args = parser.parse_args()
-    # Bitwidth check
-    if args.bits.is_integer():
-        args.bits = int(args.bits)
-    else:
-        assert args.bits == quant_utils.TERNARY_BITWIDTH, "Only ternary quantization is supported for non-integer bitwidths."
 
     return args
 
@@ -126,10 +112,13 @@ def main():
     dtype = getattr(torch, args.dtype)
     # Init W&B logger
     if args.log_wandb and dist_utils.is_main():
+        assert wandb_enabled, "wandb not installed. try `pip install wandb`"
         wandb.init(config=args)
 
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    # Sanity check
+    assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
     config.ep_size = world_size
@@ -274,14 +263,12 @@ def main():
 
                 handles[layer_name] = gptq.GPTQ(
                     layer,
-                    args.perchannel,
                     args.group_size,
                     args.sym,
                     args.rel_damp,
                     args.block_size,
                     args.quantization_order,
                     args.quantization_scale,
-                    args.static_groups,
                     is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
                     tied_gptq_handle=tied_gptq_handle
                 )    
@@ -435,6 +422,17 @@ def main():
 
         torch.cuda.empty_cache()
         gc.collect()
+
+    # Save quantization metadata
+    if args.save_dir:
+        torch.save(
+            {
+                "bits": args.bits,
+                "group_size": args.group_size,
+                "quantize_only_experts": args.quantize_only_experts
+            },
+            os.path.join(args.save_dir, "metadata.pt")
+        )
 
     dist.destroy_process_group()
 

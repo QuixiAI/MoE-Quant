@@ -1,14 +1,19 @@
 import math
 from enum import Enum
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+import triton
+from triton import language as tl
+
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision("highest")
 
 
 FP8_GROUP_SIZE = 128
-TERNARY_BITWIDTH = 1.585
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 
 
@@ -17,90 +22,222 @@ class QuantizationScale(Enum):
     MSE = "mse"
 
 
-def pack4to8(x: Tensor):
-    return 16 * x[..., : x.shape[-1] // 2] + x[..., x.shape[-1] // 2 :]
+@triton.jit
+def tl_pow(x, a):
+    return (x.abs().log() * a).exp()  # TODO: triton does not have x.pow(a) or x ** a?
 
 
-def pack8to4(x: Tensor):
-    return torch.cat([x // 16, x % 16], dim=-1)
+@triton.jit
+def tl_round(x):
+    return (
+        x + 0.5
+    ).floor()  # TODO: triton does not have round()? We might want to change to round to even number here.
 
 
-def quantize_dequantize(x, scale, zero, maxq, eps=1e-9):
-    q = torch.clamp(torch.round(x / scale.clamp_min(eps) + zero), 0, maxq)
-    return scale * (q - zero)
+@triton.jit
+def tl_round_fp(x, dtype):
+    return x if dtype is None else x.cast(dtype, fp_downcast_rounding="rtne").cast(x.dtype)
 
 
-def quantize(x, scale, zero, maxq, eps=1e-9):
-    q = torch.clamp(torch.round(x / scale.clamp_min(eps) + zero), 0, maxq)
-    return q
+@triton.jit
+def tl_quantize(x, scale, qzero, maxq):
+    return tl.clamp(tl_round(x / scale + qzero), 0.0, maxq)
 
 
-def dequantize(x, scale, zero):
-    return scale * (x - zero)
+@triton.jit
+def tl_dequantize(qx, scale, qzero, dtype):
+    return tl_round_fp((qx - qzero) * scale, dtype)
 
 
-class Quantizer:
+@triton.jit
+def tl_dequantize_quantized(x, scale, qzero, maxq, dtype):
+    return tl_dequantize(tl_quantize(x, scale, qzero, maxq), scale, qzero, dtype)
 
-    def __init__(self):
-        super().__init__()
 
-    def configure(
-        self,
-        bits: Union[int, float],
-        perchannel: bool = False,
-        sym: bool = True,
-        # Scale search parameters
-        quantization_scale: str = "absmax",
-        scale_search_iters: int = 100,
-    ):
-        if isinstance(bits, float) and not bits.is_integer():
-            assert bits == TERNARY_BITWIDTH, "Only ternary non-integer quantization is supported."
-        self.bits = bits
-        self.maxq = int(2 ** bits - 1)
-        self.perchannel = perchannel
-        self.sym = sym
-        # Scale search parameters
-        self.quantization_scale = QuantizationScale(quantization_scale)
-        self.scale_search_iters = scale_search_iters
+def round_fp(x: torch.Tensor, dtype: torch.dtype = None) -> torch.Tensor:
+    return x if dtype is None else x.to(dtype=dtype).to(x.dtype)
 
-    def get_scale_and_zero(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_rows = x.shape[0]
-        eps = torch.finfo(x.dtype).eps
 
-        if self.perchannel:
-            x = x.flatten(1)
-        else:
-            x = x.flatten().unsqueeze(0)
+def quantize(x: torch.Tensor, scale: torch.Tensor, qzero: torch.Tensor, maxq: torch.Tensor) -> torch.Tensor:
+    return (x / scale + qzero).round().clamp(torch.zeros_like(maxq), maxq)
 
-        xmin = x.amin(dim=1, keepdim=True)
-        xmax = x.amax(dim=1, keepdim=True)
 
-        if self.sym:
-            xmax = torch.maximum(torch.abs(xmin), xmax)
-            tmp = xmin < 0
-            if torch.any(tmp):
-                xmin[tmp] = -xmax[tmp]
-        tmp = xmin == xmax
-        xmin[tmp] = -1
-        xmax[tmp] = +1
+def dequantize(qx: torch.Tensor, scale: torch.Tensor, qzero: torch.Tensor, dtype: torch.dtype = None) -> torch.Tensor:
+    return round_fp((qx - qzero) * scale, dtype)
 
-        scale = (xmax - xmin) / self.maxq
-        if self.sym:
-            zero = torch.full_like(scale, round(self.maxq / 2))
-        else:
-            zero = torch.round(-xmin / scale)
 
-        if self.quantization_scale == QuantizationScale.MSE:
-            for _ in range(self.scale_search_iters):
-                q = quantize(x, scale, zero, self.maxq)
-                delta = q - zero
-                scale = x.mul(delta).mean(dim=1, keepdim=True) / (delta.pow(2).mean(dim=1, keepdim=True) + eps)
+def dequantize_quantized(
+    x: torch.Tensor, scale: torch.Tensor, qzero: torch.Tensor, maxq: torch.Tensor, dtype: torch.dtype = None
+) -> torch.Tensor:
+    return dequantize(quantize(x, scale, qzero, maxq), scale, qzero, dtype)
 
-        if not self.perchannel:
-            scale = scale.expand((num_rows, 1))
-            zero = zero.expand((num_rows, 1))
 
-        return scale, zero
+def find_quantization_meta(
+    x: torch.Tensor,
+    bit_width: int,
+    symmetric: bool = False,
+    dtype: torch.dtype = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Find quantization metadata over dim=-1
+    x: (..., C), weight
+    bit_width: int
+    symmetric: bool, whether to set qzero to the middle
+    dtype: torch.dtype, target scale dtype, fp16 or bf16
+    """
+    epsilon: float = 1e-12
+    maxq = torch.tensor(2**bit_width - 1, dtype=x.dtype, device=x.device)  # ()
+
+    x_min = x.amax(dim=-1)
+    x_max = x.amin(dim=-1)
+
+    if symmetric:
+        scale = (2.0 / maxq) * torch.maximum(x_min.abs(), x_max.abs())
+        scale = round_fp(scale + epsilon, dtype)  # (...)
+        qzero = torch.full_like(scale, ((maxq + 1.0) * 0.5).item())  # (...)
+    else:
+        scale = round_fp((x_max - x_min) / maxq + epsilon, dtype)  # (...)
+        qzero = (-x_min / scale).round().clamp(0, maxq)  # (...)
+    return scale, qzero, maxq
+
+
+@triton.jit
+def mse_scale_triton_kernel(
+    x_ptr,
+    p_ptr,
+    scale_ptr,
+    qzero_ptr,
+    maxq_ptr,
+    dtype_ptr,
+    norm: float,
+    p_size: int,
+    group_size: int,
+    batch_size: int,
+    BLOCK_SIZE_P: tl.constexpr,
+    BLOCK_SIZE_G: tl.constexpr,
+    BLOCK_SIZE_B: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    b_offsets = pid * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)  # (R)
+    b_mask = b_offsets < batch_size  # (R)
+    x_offsets = b_offsets[:, None] * group_size + tl.arange(0, BLOCK_SIZE_G)  # (R, C)
+    x_mask = b_mask[:, None] & (tl.arange(0, BLOCK_SIZE_G) < group_size)  # (R, C)
+    p_offsets = tl.arange(0, BLOCK_SIZE_P)  # (P)
+    p_mask = p_offsets < p_size  # (P)
+    scale_ptrs = scale_ptr + b_offsets  # (R)
+
+    x = tl.load(x_ptr + x_offsets, mask=x_mask)[:, None, :]  # (R, 1, C)
+    p = tl.load(p_ptr + p_offsets, mask=p_mask)  # (P)
+    scale = tl.load(scale_ptrs, mask=b_mask)  # (R)
+    qzero = tl.load(qzero_ptr + b_offsets, mask=b_mask)[:, None, None]  # (R, 1, 1)
+    maxq = tl.load(maxq_ptr)  # ()
+    dtype = None if dtype_ptr is None else tl.load(dtype_ptr).dtype
+
+    scale_p = tl_round_fp(scale[:, None] * p, dtype)[:, :, None]  # (R, P, 1)
+    q = tl_dequantize_quantized(x, scale_p, qzero, maxq, dtype)  # (R, P, C)
+    best_idx = tl.argmin(tl.sum(tl_pow(q - x, norm), axis=-1), axis=-1, tie_break_left=False)  # (R)
+
+    scale = tl_round_fp(scale * tl.load(p_ptr + best_idx), dtype)  # (R)  # TODO: replace with tl.gather()
+    tl.store(scale_ptrs, scale, mask=b_mask)  # (R)
+
+
+def mse_scale(
+    x: torch.Tensor,
+    p: torch.Tensor,
+    scale: torch.Tensor,
+    qzero: torch.Tensor,
+    maxq: torch.Tensor,
+    dtype: torch.dtype = None,
+    norm: float = 2.4,
+) -> torch.Tensor:
+    """
+    Find the optimal scale for quantization with respect to the MSE loss
+    x: (..., C), weight
+    p: (P), shrinkage factors
+    scale: (...), initial scale, modified in-place and returned
+    qzero: (...), zero points
+    maxq: ()
+    dtype: torch.dtype, target scale dtype, fp16 or bf16
+    norm: float, norm for the loss
+    debug_mode: bool, whether to use the baseline implementation without Triton
+    """
+
+    assert (
+        x.is_contiguous()
+        and p.is_contiguous()
+        and scale.is_contiguous()
+        and qzero.is_contiguous()
+        and maxq.is_contiguous()
+    )
+    batch_size: int = torch.tensor(x.shape[:-1]).prod().item()
+    previous_device: torch.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    torch.cuda.set_device(x.device)
+    grid = lambda meta: (triton.cdiv(batch_size, meta["BLOCK_SIZE_B"]),)
+    mse_scale_triton_kernel[grid](
+        x,
+        p,
+        scale,
+        qzero,
+        maxq,
+        torch.empty(0, dtype=dtype) if dtype is not None else None,
+        norm,
+        p.size(-1),
+        x.size(-1),
+        batch_size,
+        BLOCK_SIZE_P=torch.tensor(p.size(-1)).log2().ceil().exp2().int().item(),
+        BLOCK_SIZE_G=torch.tensor(x.size(-1)).log2().ceil().exp2().int().item(),
+        BLOCK_SIZE_B=1,
+    )
+    torch.cuda.set_device(previous_device)
+    return scale
+
+
+@torch.no_grad()
+def get_quantization_grid(
+    weight: torch.Tensor,
+    group_size: int,
+    bits: int,
+    symmetric: bool = False,
+    dtype: torch.dtype = None,
+    quantization_scale: QuantizationScale = QuantizationScale.ABSMAX,
+    quant_max_shrink: float = 0.2,
+    quant_n_grid: int = 100,
+    quant_norm: float = 2.4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Get the quantization grid for the weight matrix
+    weight: (..., (R), C)
+    scale: (..., (R), C)
+    qzero: (..., (R), C)
+    maxq: ()
+    """
+    weight = weight.unflatten(dim=-1, sizes=(-1, group_size))  # (..., G, gs)
+
+    scale, qzero, maxq = find_quantization_meta(
+        x=weight,
+        bit_width=bits,
+        symmetric=symmetric,
+        dtype=dtype,
+    )  # (..., G), (..., G), ()
+    if quantization_scale == QuantizationScale.MSE:
+        search_points = torch.linspace(1, quant_max_shrink, quant_n_grid, dtype=weight.dtype, device=weight.device)
+        mse_scale(
+            x=weight.contiguous(),  # (..., G, gs)
+            p=search_points,  # (..., P)
+            scale=scale,  # (..., G)
+            qzero=qzero,  # (..., G)
+            maxq=maxq,  # ()
+            dtype=dtype,
+            norm=quant_norm,
+        )
+
+    scale = scale.repeat_interleave(group_size, dim=-1)  # (..., C)
+    qzero = qzero.repeat_interleave(group_size, dim=-1)  # (..., C)
+
+    weight = weight.flatten(start_dim=-2)  # (..., C)
+
+    assert weight.shape == scale.shape == qzero.shape and maxq.shape == ()
+    return scale, qzero, maxq  # (..., (R), C), (..., (R), C), ()
 
 
 def dequantize_linear_weight(
