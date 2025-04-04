@@ -210,7 +210,8 @@ def main():
         for layer_name in quantized_layer_names[block_idx]:
             weight_state_dict = torch.load(
                 os.path.join(args.quantized_model_path, layer_name, "quantized_weight.pt"),
-                weights_only=True
+                weights_only=True,
+                map_location="cpu"
             )
             packed_weight_state_dict = pack_weight(weight_state_dict, args.bits, args.sym, args.group_size)
             block_state_dict.pop(f"{layer_name}.weight")

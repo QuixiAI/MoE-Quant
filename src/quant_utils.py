@@ -1,6 +1,6 @@
 import math
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -46,13 +46,15 @@ class Quantizer:
 
     def configure(
         self,
-        bits,
-        perchannel=False,
-        sym=True,
+        bits: Union[int, float],
+        perchannel: bool = False,
+        sym: bool = True,
         # Scale search parameters
         quantization_scale: str = "absmax",
         scale_search_iters: int = 100,
     ):
+        if isinstance(bits, float) and not bits.is_integer():
+            assert bits == TERNARY_BITWIDTH, "Only ternary non-integer quantization is supported."
         self.bits = bits
         self.maxq = int(2 ** bits - 1)
         self.perchannel = perchannel
@@ -84,7 +86,7 @@ class Quantizer:
 
         scale = (xmax - xmin) / self.maxq
         if self.sym:
-            zero = torch.full_like(scale, (self.maxq + 1) / 2)
+            zero = torch.full_like(scale, round(self.maxq / 2))
         else:
             zero = torch.round(-xmin / scale)
 
