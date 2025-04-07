@@ -20,6 +20,15 @@ At the moment only 4-bit symmetric quantization with different quantization grou
 We hope to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`) in the future. 
 
 
+### GPTQ-quantized models on 🤗
+
+| Models | Experts Quantized | Attention blocks quantized |
+| ------ |  --------- | --------- |
+| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g) | ✅  | ✅  |
+| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts)| ✅ | ❎ |
+
+
+
 ### Usage
 
 **Model quantization**
