@@ -107,6 +107,10 @@ This code was tested with the following versions of libraries:
 * `transformers                      4.50.0`
 * `vllm                              0.8.2`
 
+### Contributors
+
+Denis Kuznedelev (Yandex), Eldar Kurtić (Red Hat AI & ISTA), Jiale Chen (ISTA), Michael Goin (Red Hat AI), Dan Alistarh (Red Hat AI & ISTA).
+
 ### Citation
 
 ```
