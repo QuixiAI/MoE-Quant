@@ -22,11 +22,12 @@ We hope to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`
 
 ### GPTQ-quantized models on 🤗
 
-| Models | Experts Quantized | Attention blocks quantized |
-| ------ |  --------- | --------- |
-| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g) | ✅  | ✅  |
-| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts)| ✅ | ❎ |
+| Models | Experts Quantized | Attention blocks quantized | Size (Gb) |
+| ------ |  --------- | --------- | --------- |
+| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g) | ✅  | ✅  | 371 GB |
+| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts)| ✅ | ❎ | 349 GB |
 
+These models easily fit onto single 8x `A100/H100` node with context long enough for most of the applications of interest, including reasoning chains.
 
 
 ### Usage
