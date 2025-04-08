@@ -5,19 +5,19 @@ This repository provides code for `GPTQ` quantization of [DeepSeekV3](https://hu
 
 ### Features
 
-In order to quantize large model (671B parameters) with `GPTQ` algorithm in reasonable time we introduce several optimizations.
+In order to quantize large model (671B parameters) with the `GPTQ` algorithm in reasonable time we introduce several optimizations:
 
-1) Fast `triton` kernel for `GPTQ`.
-Since one has to quantize lot (really a lot of - ~45k) linear layers, use of faster `GPTQ` is a critical optimization. The provided `triton` implementation allows one to achieve ~10x relative to default `torch` implementation.
-2) Expert parallelism. We shard MLP experts across all devices to fit Hessians into VRAM, required for `GPTQ` calibration. Each process stores only a fraction of expert layers and corresponding Hessians.
-3) Data parallelism. To accelerate forward propagation we split calibration data uniformly across processes.
+1) **Fast `triton` kernel for `GPTQ`**: 
+Since one has to quantize a lot (really a lot - ~45k) of linear layers, a faster `GPTQ` procedure is critical optimization. The provided `triton` implementation allows one to achieve ~10x relative to default `torch` implementation.
+2) **Expert parallelism**: We shard MLP experts across all devices to fit Hessians into VRAM, required for `GPTQ` calibration. Each process stores only a fraction of expert layers and corresponding Hessians.
+3) **Data parallelism**:  To accelerate forward propagation we split calibration data uniformly across processes.
 
-The total runtime of algorithm is 2 hours on a server with `8xH100` (for 512 sequences of length 4096). 
+**The total runtime of the algorithm to quantize DeepSeek-V3/R1 is 2 hours on a server with `8xH100` (for 512 calibration sequences of length 4096).**  
 
-Currently we support conversion of `GPTQ`-quantized model into [compressed_tensors](https://github.com/neuralmagic/compressed-tensors) format supported in HuggingFace transformers and vLLM. 
+Currently we support conversion of `GPTQ`-quantized model into the [compressed_tensors](https://github.com/neuralmagic/compressed-tensors) format supported in HuggingFace transformers and vLLM. 
 
 At the moment only 4-bit symmetric quantization with different quantization group sizes is supported.
-We hope to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`) in the future. 
+We plan to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`) in the future. 
 
 
 ### GPTQ-quantized models on 🤗
