@@ -1,4 +1,4 @@
-## QuantSeek
+## MoE-Quant
 ---
 
 This repository provides code for `GPTQ` quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
