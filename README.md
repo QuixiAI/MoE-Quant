@@ -107,6 +107,17 @@ This code was tested with the following versions of libraries:
 * `transformers                      4.50.0`
 * `vllm                              0.8.2`
 
+### Performance benchmarking
+We follow the standard vLLM performance benchmarking with ShareGPT dataset and observe the following metrics (lower is better):
+
+|                                              | Time to First Token<br>Median TTFT (ms) ↓ | Time per Output Token<br>Median TPOT (ms) ↓ | Inter-token Latency<br>Median ITL (ms) ↓ |
+| -------------------------------------------- | :-------------------------------------: | :---------------------------------------: | :------------------------------------: |
+| cognitivecomputations/DeepSeek-R1-AWQ        | 1585.45                                 | 55.41                                     | 43.06                                  |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts | 1344.68                                 | 41.49                                     | 36.33                                  |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g         | 815.19                                  | 44.65                                     | 37.88                                  |
+
+GPTQ models are faster across all metrics than AWQ models because GPTQ uses less bits-per-parameter than AWQ. More specifically, AWQ has to use smaller group-size of 64 (vs 128 in GPTQ) to preserve accuracy, and zero-points due to asymmetric quantization. 
+
 ### Contributors
 
 Denis Kuznedelev (Yandex), Eldar Kurtić (Red Hat AI & ISTA), Jiale Chen (ISTA), Michael Goin (Red Hat AI), Elias Frantar (ISTA), Dan Alistarh (Red Hat AI & ISTA).
