@@ -45,7 +45,7 @@ These models easily fit onto single 8x `A100/H100` node with context long enough
 | deepseek/DeepSeek-R1                         | 100.00       | 82.99         | 78.33               | 97.24              | 73.38                  |
 | cognitivecomputations/DeepSeek-R1-AWQ        | 94.29        | 78.25         | 70.67               | 93.64              | 70.46                  |
 | ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g         | 96.52        | 80.10         | 72.96               | 97.09              | 70.26                  |
-| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts | 98.81        | 82.00         | 77.00               | 97.08              | 71.92                  |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts | **98.81**        | 82.00         | 77.00               | 97.08              | 71.92                  |
 
 ### Usage
 
