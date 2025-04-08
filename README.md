@@ -109,7 +109,7 @@ This code was tested with the following versions of libraries:
 
 ### Contributors
 
-Denis Kuznedelev (Yandex), Eldar Kurtić (Red Hat AI & ISTA), Jiale Chen (ISTA), Michael Goin (Red Hat AI), Dan Alistarh (Red Hat AI & ISTA).
+Denis Kuznedelev (Yandex), Eldar Kurtić (Red Hat AI & ISTA), Jiale Chen (ISTA), Michael Goin (Red Hat AI), Elias Frantar (ISTA), Dan Alistarh (Red Hat AI & ISTA).
 
 ### Citation
 
