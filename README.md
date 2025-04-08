@@ -32,7 +32,7 @@ These models easily fit onto single 8x `A100/H100` node with context long enough
 **Evaluation results on OpenLLM Leaderboard V1 tasks** 
 
 |                                              | Recovery (%) | Average Score | ARC-Challenge<br>acc_norm, 25-shot | GSM8k<br>exact_match, 5-shot | HellaSwag<br>acc_norm, 10-shot | MMLU<br>acc, 5-shot | TruthfulQA<br>mc2, 0-shot | WinoGrande<br>acc, 5-shot |
-| -------------------------------------------- | ------------ | ------------- | ---------------------------------- | ---------------------------- | ------------------------------ | ------------------- | ------------------------- | ------------------------- |
+| :------------------------------------------: | :----------: | :-----------: | :--------------------------------: | :--------------------------: | :----------------------------: | :-----------------: | :-----------------------: | :-----------------------: |
 | deepseek/DeepSeek-R1                         | 100.00       | 81.04         | 72.53                              | 95.91                        | 89.30                          | 87.22               | 59.28                     | 82.00                     |
 | cognitivecomputations/DeepSeek-R1-AWQ        | 100.07       | 81.10         | 73.12                              | 95.15                        | 89.07                          | 86.86               | 60.09                     | 82.32                     |
 | ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g         | 99.86        | 80.93         | 72.70                              | 95.68                        | 89.25                          | 86.83               | 58.77                     | 82.32                     |
@@ -40,12 +40,12 @@ These models easily fit onto single 8x `A100/H100` node with context long enough
 
 **Evaluation results on reasoning tasks (AIME-24, GPQA-Diamond, MATH-500)** 
 
-|      Model                                   | AIME-2024 pass@1 | MATH-500 pass@1 | GPQA-Diamond pass@1 | Average | Recovery |
-|-----------------------------------------|------------------|-----------------|---------------------|---------|----------|
-| deepseek-ai/DeepSeek-R1                       |     78.34       |       97.24     |        73.383       |  82.99  |   100.00    |
-| cognitivecomputations/DeepSeek-R1-AWQ |     70.67      |       93.64     |        70.456       |  78.25  |  94.29   |
-| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g            |  72.96    |    97.08  |        70.26        |  80.10   |  96.52   |
-| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts            |  77.00         |    97.08       |        71.92       |   82.00    |  98.81   |
+|                                              | Recovery (%) | Average Score | AIME 2024<br>pass@1 | MATH-500<br>pass@1 | GPQA Diamond<br>pass@1 |
+| -------------------------------------------- | :----------: | :-----------: | :-----------------: | :----------------: | :--------------------: |
+| deepseek/DeepSeek-R1                         | 100.00       | 82.99         | 78.33               | 97.24              | 73.38                  |
+| cognitivecomputations/DeepSeek-R1-AWQ        | 94.29        | 78.25         | 70.67               | 93.64              | 70.46                  |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g         | 96.52        | 80.10         | 72.96               | 97.09              | 70.26                  |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts | 98.81        | 82.00         | 77.00               | 97.08              | 71.92                  |
 
 ### Usage
 
