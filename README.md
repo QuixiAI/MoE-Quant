@@ -24,10 +24,19 @@ We hope to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`
 
 | Models | Experts Quantized | Attention blocks quantized | Size (Gb) |
 | ------ |  --------- | --------- | --------- |
-| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g) | ✅  | ✅  | 371 GB |
-| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts)| ✅ | ❎ | 349 GB |
+| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g) | ✅  | ✅  | 325 GB |
+| [ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts)| ✅ | ❌ | 346 GB |
 
 These models easily fit onto single 8x `A100/H100` node with context long enough for most of the applications of interest, including reasoning chains.
+
+**Evaluation results on reasoning tasks (AIME-24, GPQA-Diamond, MATH-500)** 
+
+|      Model                                   | AIME-2024 pass@1 | MATH-500 pass@1 | GPQA-Diamond pass@1 | Average | Recovery |
+|-----------------------------------------|------------------|-----------------|---------------------|---------|----------|
+| deepseek-ai/DeepSeek-R1                       |     78.34       |       97.24     |        73.383       |  82.99  |   100.00    |
+| cognitivecomputations/DeepSeek-R1-AWQ |     70.67      |       93.64     |        70.456       |  78.25  |  94.29   |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g            |  72.96    |    97.08  |        70.26        |  80.10   |  96.52   |
+| ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts            |  77.00         |    97.08       |        71.92       |   82.00    |  98.81   |
 
 
 ### Usage
