@@ -1,7 +1,7 @@
 ## MoE-Quant
 ---
 
-This repository provides code for `GPTQ` quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
+This repository provides code for [GPTQ](https://arxiv.org/abs/2210.17323) quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
 
 ### Features
 
@@ -106,3 +106,14 @@ This code was tested with the following versions of libraries:
 * `torch                             2.5.1` 
 * `transformers                      4.50.0`
 * `vllm                              0.8.2`
+
+### Citation
+
+```
+@article{frantar-gptq,
+  title={{GPTQ}: Accurate Post-training Compression for Generative Pretrained Transformers}, 
+  author={Elias Frantar and Saleh Ashkboos and Torsten Hoefler and Dan Alistarh},
+  year={2022},
+  journal={arXiv preprint arXiv:2210.17323}
+}
+```
