@@ -100,7 +100,7 @@ Above:
 * `--quantized_model_path` - path to quantized weights (output of `quant.py`)
 * `--packed_model_path` - path to model in `compressed_tensors` format ready for inference in HF and vLLM.
 
-### Enviroment
+### Environment
 
 This code was tested with the following versions of libraries:
 * `torch                             2.5.1` 
