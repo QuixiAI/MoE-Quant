@@ -38,40 +38,6 @@ def parse_args():
         required=True,
         help="Whether to save packed model."
     )
-    # Quantization params
-    parser.add_argument(
-        "--bits",
-        type=int,
-        required=True,
-        help="Quantization bitwidth.",
-    )
-    parser.add_argument(
-        "--group_size",
-        type=int,
-        default=None,
-        help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
-    )
-    parser.add_argument(
-        "--act_order",
-        action="store_true",
-        help="Whether to permute in activation order.",
-    )
-    parser.add_argument(
-        "--sym", 
-        action="store_true", 
-        help="Whether to use symmetric quantization"
-    )
-    parser.add_argument(
-        "--perchannel",
-        action="store_true",
-        help="Fit a unique quantizer to each output dim",
-    )
-    parser.add_argument(
-        "--quantize_only_experts", 
-        default=False, 
-        action="store_true", 
-        help="Whether to quantize only routed (non-shared) experts."
-    )
      # Misc params
     parser.add_argument(
         "--dtype", 
@@ -163,12 +129,21 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
+    # Load quantization metadata
+    metadata = torch.load(os.path.join(args.quantized_model_path, "metadata.pt"))
+    args.bits = metadata["bits"]
+    args.group_size = metadata["group_size"]
+    args.quantize_only_experts = metadata["quantize_only_experts"]
+    # Currently we do not support asymmetric quantization
+    args.sym = False
+
     num_output_shards = len(model.model.layers) + 2
     current_output_shard_id = 1
     quantized_layer_names = defaultdict(list)
     for layer_name in sorted(os.listdir(args.quantized_model_path)):
-        block_idx = int(layer_name.split(".")[2])
-        quantized_layer_names[block_idx].append(layer_name)
+        if os.path.isdir(os.path.join(args.quantized_model_path, layer_name)):
+            block_idx = int(layer_name.split(".")[2])
+            quantized_layer_names[block_idx].append(layer_name)
     safetensors_index = {}
     # Prepare directory to save packed weights
     os.makedirs(args.packed_model_path, exist_ok=True)
