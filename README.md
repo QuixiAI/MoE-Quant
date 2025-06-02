@@ -3,6 +3,10 @@
 
 This repository provides code for [GPTQ](https://arxiv.org/abs/2210.17323) quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
 
+### News 🔥
+
+- [2025/06] Quantized DeepSeek-R1-0528 model is on 🤗 hub. 
+
 ### Features
 
 In order to quantize large model (671B parameters) with the `GPTQ` algorithm in reasonable time we introduce several optimizations:
@@ -21,6 +25,9 @@ We plan to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`
 
 
 ### GPTQ-quantized models on 🤗
+
+---
+#### DeepSeek-R1
 
 | Models | Experts Quantized | Attention blocks quantized | Size (Gb) |
 | ------ |  --------- | --------- | --------- |
@@ -46,6 +53,20 @@ These models easily fit onto single 8x `A100/H100` node with context long enough
 | cognitivecomputations/DeepSeek-R1-AWQ        | 94.29        | 78.25         | 70.67               | 93.64              | 70.46                  |
 | ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g         | 96.52        | 80.10         | 72.96               | 97.09              | 70.26                  |
 | ISTA-DASLab/DeepSeek-R1-GPTQ-4b-128g-experts | **98.81**        | 82.00         | 77.00               | 97.08              | 71.92                  |
+
+---
+#### DeepSeek-R1-0528
+
+| Models | Experts Quantized | Attention blocks quantized | Size (Gb) |
+| ------ |  --------- | --------- | --------- |
+| [ISTA-DASLab/DeepSeek-R1-0528-GPTQ-4b-128g-experts](https://huggingface.co/ISTA-DASLab/DeepSeek-R1-0528-GPTQ-4b-128g-experts)| ✅ | ❌ | 346 GB |
+
+**Evaluation results on reasoning tasks (AIME-24, GPQA-Diamond, MATH-500)** 
+
+|                                             | Recovery (%) | Average Score | AIME 2024<br>pass@1 | MATH-500<br>pass@1 | GPQA Diamond<br>pass@1 |
+| ------------------------------------------- | :----------: | :-----------: | :-----------------: | :----------------: | :--------------------: |
+| deepseek/DeepSeek-R1-0528                   | 100.00       | 88.61         | 88.66               | 97.52              | 79.65                  |
+| ISTA-DASLab/DeepSeek-R1-0528-GPTQ-4b-128g-experts | 99.82   | 88.45         | 87.33               | 97.40              | 80.61                  |
 
 ### Usage
 
