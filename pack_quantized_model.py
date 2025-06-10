@@ -135,7 +135,7 @@ def main():
     args.group_size = metadata["group_size"]
     args.quantize_only_experts = metadata["quantize_only_experts"]
     # Currently we do not support asymmetric quantization
-    args.sym = False
+    args.sym = True
 
     num_output_shards = len(model.model.layers) + 2
     current_output_shard_id = 1
