@@ -16,7 +16,7 @@ except:
     wandb_enabled = False
 
 
-from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq
+from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq, awq
 
 
 ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
@@ -41,6 +41,14 @@ def parse_args():
     )
     parser.add_argument("--num_calibration_samples", default=128, type=int, help="Number of samples for calibration.")
     parser.add_argument("--max_sequence_length", default=8192, type=int, help="Calibration sequence length.")
+    # Quantization method
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="gptq",
+        choices=["gptq", "awq"],
+        help="Quantization method to use",
+    )
     # Quantization params
     parser.add_argument(
         "--bits",
@@ -56,10 +64,16 @@ def parse_args():
         help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
     )
     parser.add_argument("--sym", action="store_true", help="Whether to use symmetric quantization")
-    parser.add_argument("--rel_damp", type=float, default=1e-2)
-    parser.add_argument("--block_size", type=int, default=128)
+    # GPTQ-specific params
+    parser.add_argument("--rel_damp", type=float, default=1e-2, help="GPTQ relative damping")
+    parser.add_argument("--block_size", type=int, default=128, help="GPTQ block size")
     parser.add_argument("--quantization_scale", type=str, default="absmax", choices=["absmax", "mse"])
     parser.add_argument("--quantization_order", type=str, default="default", choices=["default", "activation"])
+    parser.add_argument("--tie_gptq_handles", action="store_true", help="whether to reuse hessian between gate and up projections.")
+    # AWQ-specific params
+    parser.add_argument("--duo_scaling", action="store_true", default=True, help="AWQ duo scaling")
+    parser.add_argument("--awq_grid_size", type=int, default=20, help="AWQ grid search size")
+    # Common params
     parser.add_argument(
         "--quantize_only_experts",
         default=False,
@@ -73,11 +87,10 @@ def parse_args():
     parser.add_argument("--log_error", default=False, action="store_true", help="Whether to log relative L2 error")
     # Misc params
     parser.add_argument("--offload_activations", action="store_true", help="whether to offload activations to CPU.")
-    parser.add_argument("--tie_gptq_handles", action="store_true", help="whether to reuse hessian between gate and up projections.")
     parser.add_argument("--resume", action="store_true", help="whether to resume quantization from latest checkpoint.")
     parser.add_argument("--seed", default=0, type=int, help="Random seed.")
     parser.add_argument(
-        "--dtype", default="float16", type=str, choices=["float16s", "bfloat16"], help="Torch dtype used."
+        "--dtype", default="float16", type=str, choices=["float16", "bfloat16"], help="Torch dtype used."
     )
     args = parser.parse_args()
 
@@ -115,10 +128,16 @@ def main():
         assert wandb_enabled, "wandb not installed. try `pip install wandb`"
         wandb.init(config=args)
 
-    # Load DeepSeek model
+    # Load model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     # Sanity check
-    assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
+    supported_architectures = ["DeepseekV3ForCausalLM", "KimiK2ForCausalLM"]
+    assert config.architectures[0] in supported_architectures, f"Only {supported_architectures} are supported!"
+    
+    # Model type detection
+    model_type = config.architectures[0]
+    is_deepseek_v3 = model_type == "DeepseekV3ForCausalLM"
+    is_kimi_k2 = model_type == "KimiK2ForCausalLM"
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
     config.ep_size = world_size
@@ -144,7 +163,28 @@ def main():
     # Load initial weight shard
     weight_dir = args.model_name_or_path
     current_shard_id = 1
-    weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
+    
+    # Detect total number of shards from model.safetensors.index.json
+    import json
+    index_file = os.path.join(weight_dir, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        with open(index_file, 'r') as f:
+            index_data = json.load(f)
+        # Get unique shard filenames
+        shard_files = set(index_data['weight_map'].values())
+        # Extract the total count from filename pattern
+        import re
+        for shard_file in shard_files:
+            match = re.search(r'model-\d+-of-(\d+)\.safetensors', shard_file)
+            if match:
+                total_shards = int(match.group(1))
+                break
+        else:
+            total_shards = 163  # Default for DeepSeek V3
+    else:
+        total_shards = 163  # Default for DeepSeek V3
+    
+    weight_path = f"model-{current_shard_id:05}-of-{total_shards:06}.safetensors"
 
     param_buffer = {}
     if dist_utils.is_main():
@@ -200,7 +240,7 @@ def main():
             block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
             while not (is_subset(block_keys_with_prefix, set(param_buffer.keys())) and can_dequantize):
                 current_shard_id += 1
-                weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
+                weight_path = f"model-{current_shard_id:05}-of-{total_shards:06}.safetensors"
                 param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
                 # Update weights corresponding to current block
                 block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
@@ -212,7 +252,15 @@ def main():
         block.to_empty(device=device)
 
         # Simply load block state dict on master and broadcast
-        if block_idx < model.config.first_k_dense_replace:
+        # Handle model-specific layer configurations
+        if is_kimi_k2:
+            # Kimi K2: only layer 0 is fully dense (no experts)
+            is_dense_layer = block_idx == 0
+        else:
+            # DeepSeek V3 and others: use first_k_dense_replace config
+            is_dense_layer = block_idx < model.config.first_k_dense_replace
+        
+        if is_dense_layer:
             if dist_utils.is_main():
                 block.load_state_dict(block_state_dict)
             if dist_utils.is_dist_available_and_initialized():
@@ -239,7 +287,7 @@ def main():
         gc.collect()
 
         if block_idx >= resume_block_idx:
-            # Hessian estimate
+            # Standard per-layer quantization (GPTQ or AWQ)
             layers = model_utils.select_layers(model, prefix, ".*", model_utils.LINEAR_LAYERS)
             handles = {}
             hooks = {}
@@ -255,25 +303,45 @@ def main():
                 if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
                     continue
 
-                tied_gptq_handle = None
-                if args.tie_gptq_handles and layer_name.endswith("up_proj"):
-                    parent_name, _ = layer_name.rsplit(".", 1)
-                    tied_layer_name = f"{parent_name}.gate_proj"
-                    tied_gptq_handle = handles[tied_layer_name]
+                if args.method == "gptq":
+                    tied_gptq_handle = None
+                    if args.tie_gptq_handles and layer_name.endswith("up_proj"):
+                        parent_name, _ = layer_name.rsplit(".", 1)
+                        tied_layer_name = f"{parent_name}.gate_proj"
+                        tied_gptq_handle = handles[tied_layer_name]
 
-                handles[layer_name] = gptq.GPTQ(
-                    layer,
-                    args.group_size,
-                    args.sym,
-                    args.rel_damp,
-                    args.block_size,
-                    args.quantization_order,
-                    args.quantization_scale,
-                    is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
-                    tied_gptq_handle=tied_gptq_handle
-                )    
+                    handles[layer_name] = gptq.GPTQ(
+                        layer,
+                        args.group_size,
+                        args.sym,
+                        args.rel_damp,
+                        args.block_size,
+                        args.quantization_order,
+                        args.quantization_scale,
+                        is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
+                        tied_gptq_handle=tied_gptq_handle
+                    )
+                else:  # args.method == "awq"
+                    tied_awq_handle = None
+                    if args.tie_gptq_handles and layer_name.endswith("up_proj"):  # Reuse same flag for AWQ
+                        parent_name, _ = layer_name.rsplit(".", 1)
+                        tied_layer_name = f"{parent_name}.gate_proj"
+                        tied_awq_handle = handles.get(tied_layer_name)
 
-                if tied_gptq_handle is None:
+                    handles[layer_name] = awq.AWQ(
+                        layer,
+                        args.group_size,
+                        args.sym,
+                        args.duo_scaling,
+                        args.awq_grid_size,
+                        is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
+                        tied_awq_handle=tied_awq_handle,
+                        offload_device=offload_device
+                    )    
+
+                # Only register hook if not tied (for both GPTQ and AWQ)
+                if (args.method == "gptq" and tied_gptq_handle is None) or \
+                   (args.method == "awq" and tied_awq_handle is None):
                     hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
             # Collect Hessians
@@ -302,26 +370,37 @@ def main():
                 ), f"[rank{rank}] {handle_name} weight is broken after quantization."
                 # Update issue tracker
                 num_issue_zero_samples += handle.issue_zero_samples
-                num_issue_nan_hessian += handle.issue_nan_hessian
-                num_issue_non_invertible += handle.issue_non_invertible
+                if args.method == "gptq":
+                    num_issue_nan_hessian += handle.issue_nan_hessian
+                    num_issue_non_invertible += handle.issue_non_invertible
+                else:  # AWQ
+                    num_issue_nan_hessian += int(handle.issue_nan_activations)
 
                 if args.log_error:
-                    if handle.has_hessian_issues():
+                    if (args.method == "gptq" and handle.has_hessian_issues()) or \
+                       (args.method == "awq" and handle.has_activation_issues()):
                         dist_utils.print_on_main(
-                            "An issue occured on Hessian computation. Output error cannot be estimated."
+                            f"An issue occured on {'Hessian' if args.method == 'gptq' else 'activation'} computation. Output error cannot be estimated."
                         )
                     else:
-                        relative_mse = quant_utils.get_relative_mse_error(
-                            dequantized_weight.float(), handle.layer.weight.float(), handle.H
-                        )
+                        if args.method == "gptq":
+                            relative_mse = quant_utils.get_relative_mse_error(
+                                dequantized_weight.float(), handle.layer.weight.float(), handle.H
+                            )
+                        else:  # AWQ - compute simple MSE since we don't have Hessian
+                            relative_mse = (dequantized_weight.float() - handle.layer.weight.float()).pow(2).mean()
                         dist_utils.print_on_main(f"Relative error: {relative_mse.item():.2e}")
                         if args.log_wandb and dist_utils.is_main():
                             wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
 
                 if args.save_dir and dist_utils.is_main():
                     os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
+                    save_dict = {"qweight": qweight, "scale": scale, "zero": zero}
+                    # Save AWQ smoothing scale if available
+                    if args.method == "awq" and hasattr(handle, 'smooth_scale') and handle.smooth_scale is not None:
+                        save_dict["awq_smooth_scale"] = handle.smooth_scale
                     torch.save(
-                        {"qweight": qweight, "scale": scale, "zero": zero},
+                        save_dict,
                         os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
                     )
                 # Replace original weight by quantized one
@@ -330,10 +409,13 @@ def main():
                 handle.reset()
 
             dist_utils.print_on_main("-" * 10)
-            dist_utils.print_on_main(f"GPTQ calibration issues for shared modules:")
-            dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
-            dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
-            dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+            dist_utils.print_on_main(f"{args.method.upper()} calibration issues for shared modules:")
+            dist_utils.print_on_main(f"Zero samples: {num_issue_zero_samples}")
+            if args.method == "gptq":
+                dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
+                dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+            else:  # AWQ
+                dist_utils.print_on_main(f"NaN activations: {num_issue_nan_hessian}")
             dist_utils.print_on_main("-" * 10)
 
             # Quantize experts
@@ -358,18 +440,25 @@ def main():
                     ), f"[rank{rank}] {handle_name} weight is broken after quantization."
                     # Update issue tracker
                     num_issue_zero_samples += handle.issue_zero_samples
-                    num_issue_nan_hessian += handle.issue_nan_hessian
-                    num_issue_non_invertible += handle.issue_non_invertible
+                    if args.method == "gptq":
+                        num_issue_nan_hessian += handle.issue_nan_hessian
+                        num_issue_non_invertible += handle.issue_non_invertible
+                    else:  # AWQ
+                        num_issue_nan_hessian += int(handle.issue_nan_activations)
 
                     rank_expert_message += f"Tokens collected: {handle.tokens_collected}.\n"
 
                     if args.log_error:
-                        if handle.has_hessian_issues():
-                            rank_expert_message += "Hessian issue. Output error cannot be estimated.\n"
+                        if (args.method == "gptq" and handle.has_hessian_issues()) or \
+                           (args.method == "awq" and handle.has_activation_issues()):
+                            rank_expert_message += f"{'Hessian' if args.method == 'gptq' else 'Activation'} issue. Output error cannot be estimated.\n"
                         else:
-                            relative_mse = quant_utils.get_relative_mse_error(
-                                dequantized_weight.float(), handle.layer.weight.float(), handle.H
-                            )
+                            if args.method == "gptq":
+                                relative_mse = quant_utils.get_relative_mse_error(
+                                    dequantized_weight.float(), handle.layer.weight.float(), handle.H
+                                )
+                            else:  # AWQ
+                                relative_mse = (dequantized_weight.float() - handle.layer.weight.float()).pow(2).mean()
                             rank_expert_message += f"Relative error: {relative_mse.item():.2e}\n"
                             # TODO send to main process
                             if args.log_wandb and dist_utils.is_main():
@@ -377,8 +466,12 @@ def main():
 
                     if args.save_dir:
                         os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
+                        save_dict = {"qweight": qweight, "scale": scale, "zero": zero}
+                        # Save AWQ smoothing scale if available
+                        if args.method == "awq" and hasattr(handle, 'smooth_scale') and handle.smooth_scale is not None:
+                            save_dict["awq_smooth_scale"] = handle.smooth_scale
                         torch.save(
-                            {"qweight": qweight, "scale": scale, "zero": zero},
+                            save_dict,
                             os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
                         )
                     # Replace original weight by quantized one
@@ -395,10 +488,13 @@ def main():
 
                 # TODO sync data from other processes
                 dist_utils.print_on_main("-" * 10)
-                dist_utils.print_on_main(f"GPTQ calibration issues for expert modules:")
-                dist_utils.print_on_main(f"Zero Hessian: {num_issue_zero_samples}")
-                dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
-                dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+                dist_utils.print_on_main(f"{args.method.upper()} calibration issues for expert modules:")
+                dist_utils.print_on_main(f"Zero samples: {num_issue_zero_samples}")
+                if args.method == "gptq":
+                    dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
+                    dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+                else:  # AWQ
+                    dist_utils.print_on_main(f"NaN activations: {num_issue_nan_hessian}")
                 dist_utils.print_on_main("-" * 10)
 
             del handles
@@ -427,9 +523,11 @@ def main():
     if args.save_dir:
         torch.save(
             {
+                "method": args.method,
                 "bits": args.bits,
                 "group_size": args.group_size,
-                "quantize_only_experts": args.quantize_only_experts
+                "quantize_only_experts": args.quantize_only_experts,
+                "symmetric": args.sym,
             },
             os.path.join(args.save_dir, "metadata.pt")
         )

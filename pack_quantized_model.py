@@ -151,7 +151,28 @@ def main():
     # Load initial weight shard
     weight_dir = args.model_name_or_path
     current_input_shard_id = 1
-    weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
+    
+    # Detect total number of shards from model.safetensors.index.json
+    import json
+    index_file = os.path.join(weight_dir, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        with open(index_file, 'r') as f:
+            index_data = json.load(f)
+        # Get unique shard filenames
+        shard_files = set(index_data['weight_map'].values())
+        # Extract the total count from filename pattern
+        import re
+        for shard_file in shard_files:
+            match = re.search(r'model-\d+-of-(\d+)\.safetensors', shard_file)
+            if match:
+                total_shards = int(match.group(1))
+                break
+        else:
+            total_shards = 163  # Default for DeepSeek V3
+    else:
+        total_shards = 163  # Default for DeepSeek V3
+    
+    weight_path = f"model-{current_input_shard_id:05}-of-{total_shards:06}.safetensors"
 
     param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
 
@@ -176,7 +197,7 @@ def main():
 
         while not is_subset(block_keys_with_prefix, set(param_buffer.keys())):
             current_input_shard_id += 1
-            weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
+            weight_path = f"model-{current_input_shard_id:05}-of-{total_shards:06}.safetensors"
             param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
 
         block_state_dict = {k: param_buffer[k] for k in param_buffer if k.startswith(prefix)}
@@ -209,9 +230,9 @@ def main():
         gc.collect()
 
     # Load final shard
-    if current_input_shard_id < 163:
-        current_input_shard_id = 163
-        weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
+    if current_input_shard_id < total_shards:
+        current_input_shard_id = total_shards
+        weight_path = f"model-{current_input_shard_id:05}-of-{total_shards:06}.safetensors"
         param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
 
     # Save lm head

@@ -1,7 +1,7 @@
 ## MoE-Quant
 ---
 
-This repository provides code for [GPTQ](https://arxiv.org/abs/2210.17323) quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
+This repository provides code for [GPTQ](https://arxiv.org/abs/2210.17323) and [AWQ](https://arxiv.org/abs/2306.00978) quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
 
 ### News 🔥
 
@@ -21,7 +21,7 @@ Since one has to quantize a lot (really a lot - ~45k) of linear layers, a faster
 Currently we support conversion of `GPTQ`-quantized model into the [compressed_tensors](https://github.com/neuralmagic/compressed-tensors) format supported in HuggingFace transformers and vLLM. 
 
 At the moment only 4-bit symmetric quantization with different quantization group sizes is supported.
-We plan to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`) in the future. 
+We plan to implement other bit widths and quantization formats (`AutoGPQ`) in the future. 
 
 
 ### GPTQ-quantized models on 🤗
@@ -72,6 +72,7 @@ These models easily fit onto single 8x `A100/H100` node with context long enough
 
 **Model quantization**
 
+**GPTQ:**
 ```shell
 torchrun --nnodes=1 --nproc-per-node=$NUM_GPUS --master_port 29501 quant.py \
     --model_name_or_path $MODEL_PATH \
@@ -91,15 +92,37 @@ torchrun --nnodes=1 --nproc-per-node=$NUM_GPUS --master_port 29501 quant.py \
     --save_dir <SAVE_DIR>
 ```
 
+**AWQ:**
+```shell
+torchrun --nnodes=1 --nproc-per-node=$NUM_GPUS --master_port 29501 quant.py \
+    --model_name_or_path $MODEL_PATH \
+    --dataset_name_or_path $DATASET \
+    --method awq \
+    --num_calibration_samples 256 \
+    --max_sequence_length 4096 \
+    --bits 4 \
+    --group_size 128 \
+    --sym \
+    --duo_scaling \
+    --awq_grid_size 20 \
+    --offload_activations \
+    --quantize_only_experts \
+    --dtype bfloat16 \
+    --save_dir <SAVE_DIR>
+```
+
 Above:
 * `--model_name_or_path` - **exact path** to model weights, say (`$HF_HOME/hub/models/models--deepseek-ai--DeepSeek-V3-0324/snapshots/commit_hash/`)
 * `--dataset_name_or_path` - dataset used for calibration. We provide 3 choices `open-thoughts`, `open-platypus`, `fineweb-edu`
+* `--method` - quantization method: `gptq` (default) or `awq`
 * `--num_calibration_samples` - number of calibration samples
 * `--max_sequence_length` - maximal length of calibration samples (samples longer are capped to this value)
-* `--quantization_order` - `default` or `activation`, we recommend using the latter for best results
-* `--quantization_scale` - `absmax` or `mse`, we recommend using the latter for best results
+* `--quantization_order` - (GPTQ only) `default` or `activation`, we recommend using the latter for best results
+* `--quantization_scale` - (GPTQ only) `absmax` or `mse`, we recommend using the latter for best results
+* `--duo_scaling` - (AWQ only) use duo scaling for better quantization quality
+* `--awq_grid_size` - (AWQ only) grid search size for finding optimal scales
 * `--quantize_only_experts` - quantize only *non-shared* experts. Yields potentially better accuracy at the cost of slightly higher memory overhead.
-* `--tie_gptq_handles` - reuse the same Hessian for `up` and `gate` projections to reduce memory overhead on quantization
+* `--tie_gptq_handles` - (GPTQ only) reuse the same Hessian for `up` and `gate` projections to reduce memory overhead on quantization
 * `--save_dir` - directory to save the model
 
 The scripts above produces a directory with quantization metadata for each quantized layer, i.e `quantized_weight`, `scale`, and `zero`.
