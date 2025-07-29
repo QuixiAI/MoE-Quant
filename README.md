@@ -1,3 +1,5 @@
+# Fork of MoE-Quant adding AWQ and Kimi K2 support
+
 ```
 torchrun --nnodes=1 --nproc-per-node=8 --master_port 29501 quant.py     --model_name_or_path /home/hotaisle/models/Kimi-K2-Instruct-BF16     --dataset_name_or_path open-platypus     --method awq     --num_calibration_samples 256     --max_sequence_length 4096     --bits 4     --group_size 128     --sym     --duo_scaling     --awq_grid_size 20     --offload_activations     --quantize_only_experts     --dtype bfloat16     --save_dir /home/hotaisle/models/Kimi-K2-Instruct-AWQ
 ```
