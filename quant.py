@@ -2,12 +2,16 @@ import os
 import gc
 import re
 import argparse
+import json
+import shutil
 
 from tqdm import tqdm
 import torch
 import torch.distributed as dist
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from safetensors.torch import save_file
+from compressed_tensors.compressors import pack_to_int32
 
 try:
     import wandb
@@ -21,6 +25,57 @@ from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils,
 
 ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
 TIED_FFN_GROUPS = ("gate_proj", "up_proj")
+
+
+# Global variables to accumulate quantized weights
+current_shard = {}
+current_shard_size = 0
+shard_count = 0
+weight_map = {}  # Maps weight names to shard files
+MAX_SHARD_SIZE = 10 * 1024**3  # 10GB per shard
+
+
+def _add_to_shard(tensors, save_dir):
+    """Add tensors to current shard and save if size exceeds limit"""
+    global current_shard, current_shard_size, shard_count, weight_map
+    
+    # Calculate size of new tensors
+    new_size = sum(t.nbytes for t in tensors.values())
+    
+    # Check if we need to save current shard
+    if current_shard and current_shard_size + new_size > MAX_SHARD_SIZE:
+        _save_current_shard(save_dir)
+    
+    # Add tensors to current shard
+    current_shard.update(tensors)
+    current_shard_size += new_size
+    
+    # Update weight map
+    shard_filename = f"model-{shard_count + 1:05d}.safetensors"
+    for key in tensors:
+        weight_map[key] = shard_filename
+
+
+def _save_current_shard(save_dir):
+    """Save current shard to disk"""
+    global current_shard, current_shard_size, shard_count
+    
+    if not current_shard:
+        return
+    
+    shard_count += 1
+    shard_filename = f"model-{shard_count:05d}.safetensors"
+    shard_path = os.path.join(save_dir, shard_filename)
+    
+    print(f"Saving shard {shard_filename} with {len(current_shard)} tensors...")
+    os.makedirs(save_dir, exist_ok=True)
+    save_file(current_shard, shard_path)
+    
+    # Clear current shard
+    current_shard = {}
+    current_shard_size = 0
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 def parse_args():
@@ -164,27 +219,62 @@ def main():
     weight_dir = args.model_name_or_path
     current_shard_id = 1
     
-    # Detect total number of shards from model.safetensors.index.json
+    # Detect total number of shards and file naming pattern from model.safetensors.index.json
     import json
     index_file = os.path.join(weight_dir, "model.safetensors.index.json")
+    padding_format = None
     if os.path.exists(index_file):
         with open(index_file, 'r') as f:
             index_data = json.load(f)
         # Get unique shard filenames
         shard_files = set(index_data['weight_map'].values())
-        # Extract the total count from filename pattern
+        # Extract the total count and padding format from filename pattern
         import re
         for shard_file in shard_files:
-            match = re.search(r'model-\d+-of-(\d+)\.safetensors', shard_file)
+            # Try different patterns
+            match = re.search(r'model-(\d+)-of-(\d+)\.safetensors', shard_file)
             if match:
-                total_shards = int(match.group(1))
+                shard_num = match.group(1)
+                total_shards = int(match.group(2))
+                # Detect padding based on actual file
+                if len(shard_num) == len(str(int(shard_num))):  # No padding
+                    padding_format = lambda idx, total: f"model-{idx}-of-{total}.safetensors"
+                else:  # Has padding
+                    shard_padding = len(shard_num)
+                    total_padding = len(match.group(2))
+                    padding_format = lambda idx, total: f"model-{idx:0{shard_padding}}-of-{total:0{total_padding}}.safetensors"
                 break
         else:
-            total_shards = 163  # Default for DeepSeek V3
+            # Default for DeepSeek V3
+            total_shards = 163
+            padding_format = lambda idx, total: f"model-{idx:05}-of-{total:06}.safetensors"
     else:
-        total_shards = 163  # Default for DeepSeek V3
+        # Fallback: check actual files in directory
+        import glob
+        model_files = glob.glob(os.path.join(weight_dir, "model-*-of-*.safetensors"))
+        if model_files:
+            # Parse first file to detect pattern
+            basename = os.path.basename(model_files[0])
+            match = re.search(r'model-(\d+)-of-(\d+)\.safetensors', basename)
+            if match:
+                shard_num = match.group(1)
+                total_shards = int(match.group(2))
+                if len(shard_num) == len(str(int(shard_num))):  # No padding
+                    padding_format = lambda idx, total: f"model-{idx}-of-{total}.safetensors"
+                else:  # Has padding
+                    shard_padding = len(shard_num)
+                    total_padding = len(match.group(2))
+                    padding_format = lambda idx, total: f"model-{idx:0{shard_padding}}-of-{total:0{total_padding}}.safetensors"
+            else:
+                # Ultimate fallback
+                total_shards = 163
+                padding_format = lambda idx, total: f"model-{idx:05}-of-{total:06}.safetensors"
+        else:
+            # Ultimate fallback
+            total_shards = 163
+            padding_format = lambda idx, total: f"model-{idx:05}-of-{total:06}.safetensors"
     
-    weight_path = f"model-{current_shard_id:05}-of-{total_shards:06}.safetensors"
+    weight_path = padding_format(current_shard_id, total_shards)
 
     param_buffer = {}
     if dist_utils.is_main():
@@ -240,7 +330,7 @@ def main():
             block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
             while not (is_subset(block_keys_with_prefix, set(param_buffer.keys())) and can_dequantize):
                 current_shard_id += 1
-                weight_path = f"model-{current_shard_id:05}-of-{total_shards:06}.safetensors"
+                weight_path = padding_format(current_shard_id, total_shards)
                 param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
                 # Update weights corresponding to current block
                 block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
@@ -262,25 +352,37 @@ def main():
         
         if is_dense_layer:
             if dist_utils.is_main():
-                block.load_state_dict(block_state_dict)
+                # Filter out rotary embedding keys that might not be expected
+                filtered_state_dict = {k: v for k, v in block_state_dict.items() 
+                                     if not k.endswith('.inv_freq')}
+                block.load_state_dict(filtered_state_dict, strict=False)
             if dist_utils.is_dist_available_and_initialized():
                 dist_utils.broadcast_parameters(block)
         # Send dict with part of expets to target device
         else:
             if dist_utils.is_main():
                 # Load state dict on master
-                rank_state_dict = {k: block_state_dict[k] for k in rank_block_keys}
-                block.load_state_dict(rank_state_dict)
+                rank_state_dict = {k: block_state_dict[k] for k in rank_block_keys if k in block_state_dict}
+                # Filter out rotary embedding keys
+                filtered_rank_state_dict = {k: v for k, v in rank_state_dict.items() 
+                                          if not k.endswith('.inv_freq')}
+                block.load_state_dict(filtered_rank_state_dict, strict=False)
                 # Send to other processes
                 for i in range(1, world_size):
-                    rank_state_dict = {k: block_state_dict[k] for k in other_ranks_keys[i - 1]}
-                    for k in rank_state_dict:
+                    rank_state_dict = {k: block_state_dict[k] for k in other_ranks_keys[i - 1] if k in block_state_dict}
+                    # Filter out rotary embedding keys before sending
+                    filtered_keys = [k for k in rank_state_dict if not k.endswith('.inv_freq')]
+                    for k in filtered_keys:
                         dist.send(rank_state_dict[k].to(device), dst=i)
             else:
                 rank_state_dict = block.state_dict()
-                for k in rank_state_dict:
+                # Only receive keys that exist in current state dict and aren't inv_freq
+                valid_keys = [k for k in rank_state_dict if not k.endswith('.inv_freq')]
+                received_state_dict = {}
+                for k in valid_keys:
                     dist.recv(rank_state_dict[k], src=0)
-                block.load_state_dict(rank_state_dict)
+                    received_state_dict[k] = rank_state_dict[k]
+                block.load_state_dict(received_state_dict, strict=False)
             del rank_state_dict
         # Clear memory before calibration
         torch.cuda.empty_cache()
@@ -361,7 +463,7 @@ def main():
             num_issue_nan_hessian = 0
             num_issue_non_invertible = 0
             for handle_name, handle in shared_handles.items():
-                dist_utils.print_on_main(f"Quantizing layer {handle_name}")
+                # dist_utils.print_on_main(f"Quantizing layer {handle_name}")
                 qweight, scale, zero = handle.quantize(args.bits)
                 # Construct dequantized weight
                 dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
@@ -393,45 +495,50 @@ def main():
                         if args.log_wandb and dist_utils.is_main():
                             wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
 
-                if args.save_dir and dist_utils.is_main():
-                    os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
-                    save_dict = {"qweight": qweight, "scale": scale, "zero": zero}
-                    # Save AWQ smoothing scale if available
+                # Save quantized weights incrementally
+                if dist_utils.is_main() and args.save_dir:
+                    tensors_to_save = {
+                        f"{handle_name}.weight": qweight.cpu(),
+                        f"{handle_name}.weight_scale": scale.cpu(),
+                        f"{handle_name}.weight_zero_point": zero.cpu()
+                    }
                     if args.method == "awq" and hasattr(handle, 'smooth_scale') and handle.smooth_scale is not None:
-                        save_dict["awq_smooth_scale"] = handle.smooth_scale
-                    torch.save(
-                        save_dict,
-                        os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
-                    )
+                        tensors_to_save[f"{handle_name}.awq_scale"] = handle.smooth_scale.cpu()
+                    
+                    # Add to current shard and save if needed
+                    _add_to_shard(tensors_to_save, args.save_dir)
                 # Replace original weight by quantized one
                 handle.layer.weight.data = dequantized_weight
                 # Destroy handle
                 handle.reset()
 
-            dist_utils.print_on_main("-" * 10)
-            dist_utils.print_on_main(f"{args.method.upper()} calibration issues for shared modules:")
-            dist_utils.print_on_main(f"Zero samples: {num_issue_zero_samples}")
-            if args.method == "gptq":
-                dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
-                dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
-            else:  # AWQ
-                dist_utils.print_on_main(f"NaN activations: {num_issue_nan_hessian}")
-            dist_utils.print_on_main("-" * 10)
+            # dist_utils.print_on_main("-" * 10)
+            # dist_utils.print_on_main(f"{args.method.upper()} calibration issues for shared modules:")
+            # dist_utils.print_on_main(f"Zero samples: {num_issue_zero_samples}")
+            # if args.method == "gptq":
+            #     dist_utils.print_on_main(f"Non-invertible: {num_issue_non_invertible}")
+            #     dist_utils.print_on_main(f"NaN Hessian: {num_issue_nan_hessian}")
+            # else:  # AWQ
+            #     dist_utils.print_on_main(f"NaN activations: {num_issue_nan_hessian}")
+            # dist_utils.print_on_main("-" * 10)
 
             # Quantize experts
             num_issue_zero_samples = 0
             num_issue_nan_hessian = 0
             num_issue_non_invertible = 0
             if len(expert_handles) > 0:
-                dist_utils.print_on_main(f"Processing experts")
+                # dist_utils.print_on_main(f"Processing experts")
 
                 expert_messages = None
                 if dist_utils.is_main():
                     expert_messages = [None for _ in range(world_size)]
                 rank_expert_message = ""
+                
+                # Collect expert metadata for gathering
+                expert_metadata = []
 
                 for handle_name, handle in expert_handles.items():
-                    rank_expert_message += f"Quantizing layer {handle_name}\n"
+                    # rank_expert_message += f"Quantizing layer {handle_name}\n"
                     qweight, scale, zero = handle.quantize(args.bits)
                     # Construct dequantized weight
                     dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
@@ -446,7 +553,7 @@ def main():
                     else:  # AWQ
                         num_issue_nan_hessian += int(handle.issue_nan_activations)
 
-                    rank_expert_message += f"Tokens collected: {handle.tokens_collected}.\n"
+                    # rank_expert_message += f"Tokens collected: {handle.tokens_collected}.\n"
 
                     if args.log_error:
                         if (args.method == "gptq" and handle.has_hessian_issues()) or \
@@ -464,21 +571,76 @@ def main():
                             if args.log_wandb and dist_utils.is_main():
                                 wandb.log({f"relative_error/{handle_name}": relative_mse.item()}, step=0)
 
-                    if args.save_dir:
-                        os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
-                        save_dict = {"qweight": qweight, "scale": scale, "zero": zero}
-                        # Save AWQ smoothing scale if available
-                        if args.method == "awq" and hasattr(handle, 'smooth_scale') and handle.smooth_scale is not None:
-                            save_dict["awq_smooth_scale"] = handle.smooth_scale
-                        torch.save(
-                            save_dict,
-                            os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
-                        )
+                    # Instead of gathering all weights, just send layer name and let rank 0 request
+                    expert_weight_data = {
+                        "layer_name": handle_name,
+                        "rank": rank,
+                        "has_awq_scale": args.method == "awq" and hasattr(handle, 'smooth_scale') and handle.smooth_scale is not None
+                    }
+                    expert_metadata.append(expert_weight_data)
+                    # Keep weights on this rank temporarily
+                    handle._temp_qweight = qweight.cpu()
+                    handle._temp_scale = scale.cpu()
+                    handle._temp_zero = zero.cpu()
+                    if expert_weight_data["has_awq_scale"]:
+                        handle._temp_awq_scale = handle.smooth_scale.cpu()
                     # Replace original weight by quantized one
                     handle.layer.weight.data = dequantized_weight
                     # Destroy handle
                     handle.reset()
 
+                # Gather expert metadata first
+                all_expert_metadata = None
+                if dist_utils.is_main():
+                    all_expert_metadata = [None for _ in range(world_size)]
+                
+                dist.gather_object(expert_metadata, all_expert_metadata, dst=0)
+                
+                # Simple approach: each rank saves its own experts to temporary files
+                # then rank 0 merges them
+                if args.save_dir:
+                    temp_dir = os.path.join(args.save_dir, f"temp_rank_{rank}")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    
+                    # Save this rank's experts to temporary location
+                    for handle_name, handle in expert_handles.items():
+                        if hasattr(handle, '_temp_qweight'):
+                            tensors = {
+                                f"{handle_name}.weight": handle._temp_qweight,
+                                f"{handle_name}.weight_scale": handle._temp_scale,
+                                f"{handle_name}.weight_zero_point": handle._temp_zero
+                            }
+                            if hasattr(handle, '_temp_awq_scale'):
+                                tensors[f"{handle_name}.awq_scale"] = handle._temp_awq_scale
+                            
+                            # Save to temporary file
+                            temp_file = os.path.join(temp_dir, f"{handle_name.replace('/', '_')}.safetensors")
+                            save_file(tensors, temp_file)
+                            
+                            # Clean up temp attributes
+                            for attr in ['_temp_qweight', '_temp_scale', '_temp_zero', '_temp_awq_scale']:
+                                if hasattr(handle, attr):
+                                    delattr(handle, attr)
+                    
+                    dist_utils.barrier(device_ids=[rank])
+                    
+                    # Rank 0 merges all temporary files
+                    if dist_utils.is_main():
+                        print("Merging expert weights from all ranks...")
+                        for r in range(world_size):
+                            temp_dir = os.path.join(args.save_dir, f"temp_rank_{r}")
+                            if os.path.exists(temp_dir):
+                                for temp_file in os.listdir(temp_dir):
+                                    if temp_file.endswith('.safetensors'):
+                                        temp_path = os.path.join(temp_dir, temp_file)
+                                        # Load and add to shard
+                                        from safetensors import safe_open
+                                        with safe_open(temp_path, framework="pt") as f:
+                                            tensors_to_add = {key: f.get_tensor(key) for key in f.keys()}
+                                        _add_to_shard(tensors_to_add, args.save_dir)
+                                        os.remove(temp_path)
+                                os.rmdir(temp_dir)
+                
                 dist_utils.barrier(device_ids=[rank])
 
                 dist.gather_object(rank_expert_message, expert_messages)
@@ -519,18 +681,126 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
 
-    # Save quantization metadata
-    if args.save_dir:
-        torch.save(
-            {
-                "method": args.method,
-                "bits": args.bits,
-                "group_size": args.group_size,
-                "quantize_only_experts": args.quantize_only_experts,
-                "symmetric": args.sym,
+    # Save the quantized model in HuggingFace format
+    if args.save_dir and dist_utils.is_main():
+        print("\nFinalizing model save...")
+        
+        # Save any remaining weights in current shard
+        if current_shard:
+            _save_current_shard(args.save_dir)
+        
+        # Now load and save non-quantized layers incrementally
+        print("Adding non-quantized layers...")
+        
+        # Load the index to find which weights we need
+        index_file = os.path.join(args.model_name_or_path, "model.safetensors.index.json")
+        with open(index_file, 'r') as f:
+            orig_index_data = json.load(f)
+        
+        orig_weight_map = orig_index_data['weight_map']
+        loaded_shards = {}
+        
+        # Process embeddings, layernorms, and attention weights
+        weights_to_process = []
+        
+        # Embeddings and final layers
+        weights_to_process.extend([
+            "model.embed_tokens.weight",
+            "model.norm.weight", 
+            "lm_head.weight"
+        ])
+        
+        # Layer-specific weights
+        for i in range(len(model.model.layers)):
+            weights_to_process.extend([
+                f"model.layers.{i}.input_layernorm.weight",
+                f"model.layers.{i}.post_attention_layernorm.weight",
+                f"model.layers.{i}.self_attn.q_proj.weight",
+                f"model.layers.{i}.self_attn.k_proj.weight", 
+                f"model.layers.{i}.self_attn.v_proj.weight",
+                f"model.layers.{i}.self_attn.o_proj.weight",
+            ])
+        
+        # Process in batches to avoid OOM
+        batch_tensors = {}
+        batch_size = 0
+        BATCH_LIMIT = 2 * 1024**3  # 2GB batches
+        
+        for weight_name in tqdm(weights_to_process, desc="Processing non-quantized weights"):
+            if weight_name in weight_map:  # Already saved as quantized
+                continue
+                
+            if weight_name in orig_weight_map:
+                shard_file = orig_weight_map[weight_name]
+                if shard_file not in loaded_shards:
+                    loaded_shards[shard_file] = loading_utils.load_param_shard(
+                        args.model_name_or_path, shard_file
+                    )
+                
+                if weight_name in loaded_shards[shard_file]:
+                    tensor = loaded_shards[shard_file][weight_name].cpu()
+                    tensor_size = tensor.nbytes
+                    
+                    # Check if adding this tensor would exceed batch limit
+                    if batch_tensors and batch_size + tensor_size > BATCH_LIMIT:
+                        _add_to_shard(batch_tensors, args.save_dir)
+                        batch_tensors = {}
+                        batch_size = 0
+                        gc.collect()
+                    
+                    batch_tensors[weight_name] = tensor
+                    batch_size += tensor_size
+                    
+                    # Clear from loaded shards to free memory
+                    del loaded_shards[shard_file][weight_name]
+                    if not loaded_shards[shard_file]:
+                        del loaded_shards[shard_file]
+        
+        # Save any remaining batch
+        if batch_tensors:
+            _add_to_shard(batch_tensors, args.save_dir)
+        
+        # Save final shard if any
+        if current_shard:
+            _save_current_shard(args.save_dir)
+        
+        # Create index file
+        index = {
+            "metadata": {
+                "total_size": sum(os.path.getsize(os.path.join(args.save_dir, f)) 
+                                for f in os.listdir(args.save_dir) 
+                                if f.endswith('.safetensors')),
+                "format": "safetensors",
+                "quantization_config": {
+                    "quant_method": args.method,
+                    "bits": args.bits,
+                    "group_size": args.group_size,
+                    "symmetric": args.sym,
+                    "quantize_only_experts": args.quantize_only_experts,
+                }
             },
-            os.path.join(args.save_dir, "metadata.pt")
-        )
+            "weight_map": weight_map
+        }
+        
+        index_path = os.path.join(args.save_dir, "model.safetensors.index.json")
+        with open(index_path, 'w') as f:
+            json.dump(index, f, indent=2)
+        
+        # Update model config with quantization info
+        config.quantization_config = {
+            "quant_method": args.method,
+            "bits": args.bits,
+            "group_size": args.group_size,
+            "symmetric": args.sym,
+            "quantize_only_experts": args.quantize_only_experts,
+        }
+        
+        # Save config and tokenizer
+        config.save_pretrained(args.save_dir)
+        tokenizer.save_pretrained(args.save_dir)
+        
+        print(f"✓ Model saved to {args.save_dir} with {shard_count} shards")
+        print(f"✓ Ready for use with vLLM or transformers!")
 
     dist.destroy_process_group()
 

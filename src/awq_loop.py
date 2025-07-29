@@ -31,24 +31,61 @@ def awq_scale_kernel(
     tl.store(w_scaled_ptr + offsets, w_scaled, mask=mask)
 
 
+def apply_awq_scale_pytorch(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Apply AWQ scale to weight using PyTorch"""
+    # Ensure scale has the correct shape for broadcasting
+    if weight.dim() == 2 and scale.dim() == 1:
+        # weight is [out_features, in_features], scale is [in_features]
+        # Reshape scale to [1, in_features] for proper broadcasting
+        scale = scale.view(1, -1)
+    elif weight.dim() == 2 and scale.dim() == 2 and scale.shape[0] == 1:
+        # scale is already [1, in_features], good to go
+        pass
+    elif weight.shape != scale.shape:
+        # Try to broadcast
+        try:
+            scale = scale.expand_as(weight)
+        except RuntimeError:
+            # If broadcasting fails, try to match the last dimension
+            if scale.numel() == weight.shape[-1]:
+                scale = scale.view(1, -1)
+            else:
+                raise ValueError(f"Cannot broadcast scale {scale.shape} to weight {weight.shape}")
+    
+    return weight * scale
+
+
 def apply_awq_scale_triton(
     weight: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
     """Apply AWQ scale to weight matrix using Triton"""
-    n_elements = weight.numel()
-    w_scaled = torch.empty_like(weight)
-    
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    awq_scale_kernel[grid](
-        weight.flatten(),
-        scale.flatten(),
-        w_scaled.flatten(),
-        n_elements,
-        BLOCK_SIZE=1024,
-    )
-    
-    return w_scaled.view(weight.shape)
+    # Check if we're on ROCm - if so, skip Triton entirely
+    if hasattr(torch.version, 'hip') or 'rocm' in torch.__version__.lower():
+        return apply_awq_scale_pytorch(weight, scale)
+        
+    try:
+        n_elements = weight.numel()
+        w_scaled = torch.empty_like(weight)
+        
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        awq_scale_kernel[grid](
+            weight.flatten(),
+            scale.flatten(),
+            w_scaled.flatten(),
+            n_elements,
+            BLOCK_SIZE=1024,
+        )
+        
+        return w_scaled.view(weight.shape)
+    except Exception as e:
+        # Fallback to PyTorch implementation if Triton fails
+        if torch.distributed.get_rank() == 0:
+            print(f"Warning: Triton AWQ apply scale kernel failed with {type(e).__name__}: {e}, falling back to PyTorch implementation")
+        return apply_awq_scale_pytorch(weight, scale)
 
 
 @triton.jit
@@ -71,10 +108,10 @@ def awq_search_scale_kernel(
     
     if duo_scaling:
         # s = (x_mean^ratio) / (w_mean^(1-ratio) + eps)
-        scale = tl.pow(x_mean, ratio) / (tl.pow(w_mean, 1.0 - ratio) + 1e-4)
+        scale = (x_mean ** ratio) / ((w_mean ** (1.0 - ratio)) + 1e-4)
     else:
         # s = x_mean^ratio
-        scale = tl.pow(x_mean, ratio)
+        scale = x_mean ** ratio
     
     # Clamp scale
     scale = tl.maximum(scale, 1e-4)
@@ -82,26 +119,22 @@ def awq_search_scale_kernel(
     tl.store(scale_out_ptr + offsets, scale, mask=mask)
 
 
-def compute_awq_scale_triton(
+def compute_awq_scale_pytorch(
     x_mean: torch.Tensor,
     w_mean: torch.Tensor,
     ratio: float,
     duo_scaling: bool = True,
 ) -> torch.Tensor:
-    """Compute AWQ scale for given ratio using Triton"""
-    n_elements = x_mean.numel()
-    scale = torch.empty_like(x_mean)
+    """Compute AWQ scale for given ratio using PyTorch"""
+    if duo_scaling:
+        # s = (x_mean^ratio) / (w_mean^(1-ratio) + eps)
+        scale = torch.pow(x_mean, ratio) / (torch.pow(w_mean, 1.0 - ratio) + 1e-4)
+    else:
+        # s = x_mean^ratio
+        scale = torch.pow(x_mean, ratio)
     
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    awq_search_scale_kernel[grid](
-        x_mean,
-        w_mean,
-        scale,
-        ratio,
-        duo_scaling,
-        n_elements,
-        BLOCK_SIZE=1024,
-    )
+    # Clamp scale
+    scale = torch.clamp(scale, min=1e-4)
     
     # Normalize scale
     scale_max = scale.max()
@@ -116,7 +149,51 @@ def compute_awq_scale_triton(
     return scale
 
 
-@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+def compute_awq_scale_triton(
+    x_mean: torch.Tensor,
+    w_mean: torch.Tensor,
+    ratio: float,
+    duo_scaling: bool = True,
+) -> torch.Tensor:
+    """Compute AWQ scale for given ratio using Triton"""
+    # Check if we're on ROCm - if so, skip Triton entirely
+    if hasattr(torch.version, 'hip') or 'rocm' in torch.__version__.lower():
+        return compute_awq_scale_pytorch(x_mean, w_mean, ratio, duo_scaling)
+    
+    try:
+        n_elements = x_mean.numel()
+        scale = torch.empty_like(x_mean)
+        
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        awq_search_scale_kernel[grid](
+            x_mean,
+            w_mean,
+            scale,
+            ratio,
+            duo_scaling,
+            n_elements,
+            BLOCK_SIZE=1024,
+        )
+        
+        # Normalize scale
+        scale_max = scale.max()
+        scale_min = scale.min()
+        if scale_max > 0 and scale_min > 0:
+            scale = scale / (scale_max * scale_min).sqrt()
+        
+        # Handle inf/nan
+        scale[torch.isinf(scale)] = 1.0
+        scale[torch.isnan(scale)] = 1.0
+        
+        return scale
+    except Exception as e:
+        # Fallback to PyTorch implementation if Triton fails
+        if torch.distributed.get_rank() == 0:
+            print(f"Warning: Triton AWQ kernel failed with {type(e).__name__}: {e}, falling back to PyTorch implementation")
+        return compute_awq_scale_pytorch(x_mean, w_mean, ratio, duo_scaling)
+
+
+@torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
 def awq_loop_graph(
     weight: torch.Tensor,
     x_mean: torch.Tensor,
@@ -201,9 +278,23 @@ def awq_loop(
     best_error = float('inf')
     best_ratio = 0.5
     
+    # Ensure device synchronization for ROCm
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    
     # Cache a small sample of activations for error computation
     # This is a simplified version - in practice you'd use actual activations
-    test_acts = torch.randn(32, n_cols, device=device).abs() * x_mean.view(1, -1)
+    # Ensure x_mean is on the correct device
+    x_mean = x_mean.to(device)
+    w_mean = w_mean.to(device)
+    
+    # Create test activations with proper device placement
+    test_acts = torch.randn(32, n_cols, device=device, dtype=weight.dtype).abs()
+    if x_mean.numel() == n_cols:
+        test_acts = test_acts * x_mean.view(1, -1)
+    
+    # Ensure weight is contiguous to avoid memory access issues
+    weight = weight.contiguous()
     org_output = torch.matmul(test_acts, weight.t())
     
     for i in range(grid_size):
@@ -212,15 +303,28 @@ def awq_loop(
         # Compute scale for this ratio
         test_scale = compute_awq_scale_triton(x_mean, w_mean, ratio, duo_scaling)
         
+        # Ensure test_scale is valid
+        test_scale = test_scale.contiguous()
+        test_scale = torch.where(test_scale == 0, torch.ones_like(test_scale), test_scale)
+        test_scale = torch.where(torch.isnan(test_scale), torch.ones_like(test_scale), test_scale)
+        test_scale = torch.where(torch.isinf(test_scale), torch.ones_like(test_scale), test_scale)
+        
         # Apply scale and quantize
-        w_scaled = apply_awq_scale_triton(weight, test_scale.view(1, -1))
+        # Ensure proper shape for test_scale
+        if test_scale.numel() == n_cols:
+            scale_for_weight = test_scale.view(1, -1)
+        else:
+            scale_for_weight = test_scale
+            
+        w_scaled = apply_awq_scale_triton(weight, scale_for_weight)
         
         # Simple quantization for error computation
         qw = torch.round(w_scaled / scale).clamp(0, maxq)
         w_dequant = qw * scale
         
         # Apply inverse scale to activations
-        scaled_acts = test_acts / test_scale.view(1, -1)
+        # Add epsilon to prevent division by zero
+        scaled_acts = test_acts / (test_scale.view(1, -1) + 1e-8)
         
         # Compute error
         quant_output = torch.matmul(scaled_acts, w_dequant.t())
@@ -230,16 +334,19 @@ def awq_loop(
             best_error = error
             best_ratio = ratio
     
-    # Use CUDA graph for final quantization
-    previous_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    torch.cuda.set_device(weight.device)
+    # Use CUDA graph for final quantization (skip on ROCm)
+    use_cuda_graph = not (hasattr(torch.version, 'hip') or 'rocm' in torch.__version__.lower())
     
-    if not hasattr(awq_loop, "graph_info"):
-        awq_loop.graph_info = {}
+    if use_cuda_graph:
+        previous_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        torch.cuda.set_device(weight.device)
         
-    graph_key = (n_rows, n_cols, weight.dtype, dtype, duo_scaling, device)
+        if not hasattr(awq_loop, "graph_info"):
+            awq_loop.graph_info = {}
+            
+        graph_key = (n_rows, n_cols, weight.dtype, dtype, duo_scaling, device)
     
-    if graph_key not in awq_loop.graph_info:
+    if use_cuda_graph and graph_key not in awq_loop.graph_info:
         graph = torch.cuda.CUDAGraph()
         graph_tensors = {
             "weight": torch.empty_like(weight),
@@ -279,22 +386,35 @@ def awq_loop(
             
         awq_loop.graph_info[graph_key] = {"graph": graph, "tensors": graph_tensors}
     
-    graph, graph_tensors = (
-        awq_loop.graph_info[graph_key]["graph"],
-        awq_loop.graph_info[graph_key]["tensors"],
-    )
-    
-    # Copy inputs
-    graph_tensors["weight"].copy_(weight)
-    graph_tensors["x_mean"].copy_(x_mean)
-    graph_tensors["w_mean"].copy_(w_mean)
-    graph_tensors["scale"].copy_(scale)
-    graph_tensors["qzero"].copy_(qzero)
-    graph_tensors["maxq"].copy_(maxq)
-    
-    # Replay graph
-    graph.replay()
-    
-    torch.cuda.set_device(previous_device)
-    
-    return graph_tensors["qweight_out"], graph_tensors["scale_out"]
+    if use_cuda_graph:
+        graph, graph_tensors = (
+            awq_loop.graph_info[graph_key]["graph"],
+            awq_loop.graph_info[graph_key]["tensors"],
+        )
+        
+        # Copy inputs
+        graph_tensors["weight"].copy_(weight)
+        graph_tensors["x_mean"].copy_(x_mean)
+        graph_tensors["w_mean"].copy_(w_mean)
+        graph_tensors["scale"].copy_(scale)
+        graph_tensors["qzero"].copy_(qzero)
+        graph_tensors["maxq"].copy_(maxq)
+        
+        # Replay graph
+        graph.replay()
+        
+        torch.cuda.set_device(previous_device)
+        
+        return graph_tensors["qweight_out"], graph_tensors["scale_out"]
+    else:
+        # Direct execution without CUDA graph (for ROCm)
+        # Compute final AWQ scale
+        best_scale = compute_awq_scale_pytorch(x_mean, w_mean, best_ratio, duo_scaling)
+        
+        # Apply scale and quantize
+        w_scaled = apply_awq_scale_pytorch(weight, best_scale.view(1, -1))
+        
+        # Quantize
+        qweight_out = torch.round(w_scaled / scale).clamp(0, maxq).to(torch.uint8)
+        
+        return qweight_out, best_scale

@@ -68,6 +68,30 @@ These models easily fit onto single 8x `A100/H100` node with context long enough
 | deepseek/DeepSeek-R1-0528                   | 100.00       | 88.61         | 88.66               | 97.52              | 79.65                  |
 | ISTA-DASLab/DeepSeek-R1-0528-GPTQ-4b-128g-experts | 99.82   | 88.45         | 87.33               | 97.40              | 80.61                  |
 
+### CPU-Only Version
+
+For systems without GPUs, we provide a CPU-only implementation that supports both GPTQ and AWQ quantization methods. See [CPU_QUANTIZATION.md](CPU_QUANTIZATION.md) for detailed instructions.
+
+**Key features:**
+- Pure PyTorch implementation without GPU/CUDA dependencies
+- Multi-threaded execution using 80% of CPU cores by default
+- Compatible output format with GPU version
+- Supports both GPTQ and AWQ quantization methods
+
+**Quick start:**
+```shell
+python quant_cpu.py \
+    --model_name_or_path $MODEL_PATH \
+    --dataset_name_or_path $DATASET \
+    --method gptq \
+    --num_calibration_samples 128 \
+    --max_sequence_length 2048 \
+    --bits 4 \
+    --group_size 128 \
+    --cpu_ratio 0.8 \
+    --save_dir <SAVE_DIR>
+```
+
 ### Usage
 
 **Model quantization**

@@ -63,7 +63,8 @@ class AWQ:
             tied_awq_handle.num_tied_handles += 1
             # Share activation statistics with tied handle
             if tied_awq_handle.activation_sum is not None:
-                self.activation_sum = tied_awq_handle.activation_sum
+                # Clone the tensors to avoid memory sharing issues
+                self.activation_sum = tied_awq_handle.activation_sum.clone()
                 self.activation_count = tied_awq_handle.activation_count
                 
         # Smoothing scale (computed during quantization)
@@ -114,10 +115,21 @@ class AWQ:
         
         # Compute running sum of absolute values (for mean calculation)
         input_abs = input.abs()
+        input_sum = input_abs.sum(dim=0)
+        
         if self.activation_sum is None:
-            self.activation_sum = input_abs.sum(dim=0).to(self.offload_device)
+            if self.offload_device is not None:
+                self.activation_sum = input_sum.to(self.offload_device)
+            else:
+                self.activation_sum = input_sum
         else:
-            self.activation_sum += input_abs.sum(dim=0).to(self.offload_device)
+            if self.offload_device is not None:
+                # Move to device for computation, then back to offload device
+                self.activation_sum = self.activation_sum.to(input.device)
+                self.activation_sum += input_sum
+                self.activation_sum = self.activation_sum.to(self.offload_device)
+            else:
+                self.activation_sum += input_sum
             
         self.activation_count += input.shape[0]
         
@@ -178,7 +190,14 @@ class AWQ:
             self.W = self.W.flatten(1, -1)
             
         # Get pruned channels (following GPTQ pattern)
-        self.x_mean = (self.activation_sum / self.activation_count).to(self.W_device)
+        # Add epsilon to prevent division by zero
+        count_safe = max(self.activation_count, 1)
+        self.x_mean = (self.activation_sum / count_safe).to(self.W_device).contiguous()
+        
+        # Handle NaN/Inf in x_mean
+        self.x_mean = torch.where(torch.isnan(self.x_mean), torch.ones_like(self.x_mean), self.x_mean)
+        self.x_mean = torch.where(torch.isinf(self.x_mean), torch.ones_like(self.x_mean), self.x_mean)
+        
         pruned_ids = self.x_mean == 0
         self.W[:, pruned_ids] = 0
         
@@ -230,14 +249,27 @@ class AWQ:
             W_scale = W_scale.view(org_shape)
             w_mean = W_scale.mean(dim=0)
             
+            # Ensure all tensors are on the same device and contiguous
+            device = self.W.device
+            weight_contig = self.W.contiguous()
+            x_mean_contig = self.x_mean.to(device).contiguous()
+            w_mean_contig = w_mean.to(device).contiguous()
+            scale_contig = scale.to(device).contiguous()
+            zero_contig = zero.to(device).contiguous()
+            maxq_device = maxq.to(device) if isinstance(maxq, torch.Tensor) else torch.tensor(maxq, device=device)
+            
+            # Synchronize before AWQ loop for ROCm
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            
             # Use AWQ loop with Triton kernels
             qweight, awq_scale = awq_loop.awq_loop(
-                weight=self.W,
-                x_mean=self.x_mean,
-                w_mean=w_mean,
-                scale=scale,
-                qzero=zero,
-                maxq=maxq,
+                weight=weight_contig,
+                x_mean=x_mean_contig,
+                w_mean=w_mean_contig,
+                scale=scale_contig,
+                qzero=zero_contig,
+                maxq=maxq_device,
                 grid_size=self.grid_size,
                 duo_scaling=self.duo_scaling,
                 dtype=dtype,
